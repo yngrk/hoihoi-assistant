@@ -699,6 +699,56 @@ Die Runde verschwand vollständig. Jetzt wird in diesem Fall sofort neu
 aufgebaut; die Aufnahme liegt im PSRAM und wird nachgeschickt, sobald die neue
 Sitzung steht. Die Frist dafür trägt den Neuaufbau: neun Sekunden.
 
+## Weckwort
+
+Geplant ist, „HoiHoi" selbst einzulernen: die eigenen Aufnahmen sind das
+Modell, es läuft ohne Dienst und ohne Lizenz, erkennt dafür vor allem die
+eigene Stimme. Der Weg über ein fertiges Modell bleibt als Rückfall offen —
+Espressifs WakeNet bringt über 80 Wörter mit (`Hi,ESP`, `Alexa`, `Jarvis`,
+`Computer`, `Sophia`, `Mycroft`, `Hey,Willow`, `Hey,Nova` und weitere), nur
+eben nicht dieses. Ein eigenes Wort trainiert Espressif gegen Gebühr aus einem
+Korpus von über 500 Sprechern, darunter mindestens 100 Kindern, je 30
+Aufnahmen; das ist kein Weg für ein Gerät.
+
+### Das Mikrofon läuft jetzt durch
+
+Das kehrt eine bewusste Entscheidung um. Bisher war der ES7210 zwischen den
+Aufnahmen zugeklappt und nicht bloß ungelesen — ein Gerät mit Mikrofon soll
+nicht dauerhaft zuhören. Für ein Weckwort geht das nicht anders.
+
+Zu bleibt der Wandler nur, solange der Lautsprecher den Port braucht. Beide
+gleichzeitig zu öffnen ist nicht möglich: das Öffnen des einen richtet **beide**
+I2S-Kanäle neu ein, im Log an vier `i2s_channel_disable`-Zeilen zu sehen.
+Daraus folgt eine Einschränkung, die bleibt, solange es keine Echokompensation
+gibt: **während die Antwort spricht, ist das Weckwort taub.** Unterbrochen wird
+weiter über die Taste.
+
+Nebenbei fällt damit die Übergabe beim Tastendruck weg — das Mikrofon steht
+schon offen, wenn die Taste heruntergeht.
+
+### Wörter abgrenzen
+
+Ein Mustervergleich kann nur so gut sein wie die Abgrenzung davor. Abgegrenzt
+wird über die Energie, nicht über ein Modell: ein quadratischer Mittelwert je
+20-ms-Block, den der Aufnahmetask ohnehin berechnet. Der Ruhepegel wird
+nachgeführt und nur in der Stille — während gesprochen wird, bliebe er stehen,
+sonst zöge sich die Schwelle an der eigenen Stimme hoch.
+
+Gemessen an zehn gesprochenen „HoiHoi" und einer Minute normalem Reden:
+
+```
+HoiHoi   400  420  420  680  420  420  660  440  340  400 ms
+```
+
+Zehn von zehn kamen als **genau ein** Segment heraus, keines zerfallen, keines
+mit dem nächsten verschmolzen; Median 420 ms. Normales Reden erzeugte 21
+Kandidaten je Minute, davon aber nur fünf im Längenfenster von 300 bis 700 ms.
+Die Längenschranke allein wirft also drei Viertel weg, bevor gerechnet wird —
+der Vergleich muss rund 360 fremde Wörter je Stunde ablehnen, nicht Tausende.
+
+Offen sind damit noch die Merkmale (MFCC), das Einlernen und der Vergleich
+selbst.
+
 ## Log auf dem Display
 
 `esp_log_set_vprintf()` gibt den bisherigen Handler zurück. Damit lässt sich

@@ -34,6 +34,7 @@
 #include "listen.h"
 #include "logview.h"
 #include "nachtrag.h"
+#include "wachwort.h"
 #include "cfg.h"
 #include "net.h"
 #include "prov.h"
@@ -1243,49 +1244,40 @@ static void audio_task(void *)
         // damit auch die Entprellung.
         listener.poll_key(gpio_get_level(KEY_BUTTON_PIN) == 0);
 
-        // Der Wandler laeuft nur waehrend einer Aufnahme. Ein Geraet mit
-        // Mikrofon soll nicht dauerhaft zuhoeren — und das ist nichts, was
-        // man glauben muessen darf: zwischen den Aufnahmen ist der ES7210
-        // zugeklappt, nicht nur ungelesen.
-        if (listener.listening() && !mic.running()) {
-            // Wer die Sprechtaste drueckt, will sprechen und nicht zuhoeren.
-            // Die laufende Antwort muss dabei nicht nur aufhoeren, sie muss
-            // den I2S-Port auch *vorher* freigeben: Mikrofon und Lautsprecher
-            // haengen an derselben Datenschnittstelle, und wer sie im selben
-            // Augenblick oeffnet und schliesst, bekommt eine Aufnahme mit
-            // null Frames — die Nachfrage ginge verloren.
-            const int64_t t_taste   = esp_timer_get_time();
-            int           runden    = 0;
-            const bool    war_stimme = tts.spricht();
-            if (war_stimme) {
-                tts.abbrechen();
-                for (; runden < 100 && tts.spricht(); runden++) {
-                    vTaskDelay(pdMS_TO_TICKS(5));
-                }
-            }
-            const int wartems = (int)((esp_timer_get_time() - t_taste) / 1000);
+        // Wer die Sprechtaste drueckt, will sprechen und nicht zuhoeren: die
+        // laufende Antwort hoert auf. Sie muss den I2S-Port dabei auch
+        // wirklich freigeben — Mikrofon und Lautsprecher haengen an derselben
+        // Datenschnittstelle, und wer sie im selben Augenblick oeffnet und
+        // schliesst, bekommt eine Aufnahme mit null Frames.
+        if (listener.listening() && tts.spricht()) {
+            tts.abbrechen();
+        }
+
+        // Das Mikrofon laeuft jetzt durch und nicht mehr nur waehrend einer
+        // Aufnahme. Das ist eine bewusst umgedrehte Entscheidung: fuer ein
+        // Weckwort muss zugehoert werden, auch wenn niemand drueckt. Zu
+        // bleibt der Wandler nur, solange der Lautsprecher den Port braucht —
+        // beide gleichzeitig zu oeffnen geht nicht, das Oeffnen des einen
+        // richtet beide I2S-Kanaele neu ein.
+        //
+        // Nebenbei faellt damit die Uebergabe beim Tastendruck weg: das
+        // Mikrofon steht schon offen, wenn die Taste heruntergeht.
+        const bool mic_soll = !tts.spricht();
+
+        if (mic_soll && !mic.running()) {
+            const int64_t t0 = esp_timer_get_time();
             mic.start();
+            wachwort::ruhe();
 
-            // Nur wenn der Lautsprecher gerade noch lief, klingt er ins
-            // Mikrofon nach. Sonst ist der Wandler vom ersten Block an sauber,
-            // und jede abgeschnittene Millisekunde fehlt am ersten Wort.
-            if (war_stimme) listener.nachklang_erwarten();
-
-            // Die Uebergabe kostet Aufnahmezeit: bis das Mikrofon steht,
-            // faellt alles Gesprochene weg. Zwei Zahlen, weil sie zwei
-            // verschiedene Fehler auseinanderhalten — viele Runden heisst,
-            // der Lautsprecher gibt den Port nicht her; wenige Runden bei
-            // langer Zeit heisst, dieser Task kam nicht dran.
-            if (wartems > 20) {
-                nachtrag::schreiben('W', TAG,
-                                    "  Uebergabe an das Mikrofon: %d ms in %d Runden.",
-                                    wartems, runden);
+            const int ms = (int)((esp_timer_get_time() - t0) / 1000);
+            if (ms > 20) {
+                nachtrag::schreiben('W', TAG, "  Mikrofon auf: %d ms.", ms);
             }
-        } else if (!listener.listening() && mic.running()) {
+        } else if (!mic_soll && mic.running()) {
             mic.stop();
 
             // Wellenbild auf die Nulllinie zuruecksetzen. Das stehengelassene
-            // Bild der letzten Aufnahme sähe aus wie ein laufendes Signal.
+            // Bild sähe aus wie ein laufendes Signal.
             xSemaphoreTake(scope_lock, portMAX_DELAY);
             memset(col_min, 0, sizeof(col_min));
             memset(col_max, 0, sizeof(col_max));
@@ -1298,6 +1290,25 @@ static void audio_task(void *)
             sum_sq    = 0;
             sum_count = 0;
             window_pk = 0;
+        }
+
+        // Faengt eine Aufnahme an, waehrend der Lautsprecher gerade noch lief,
+        // klingt er ins Mikrofon nach. Sonst ist der Wandler vom ersten Block
+        // an sauber, und jede abgeschnittene Millisekunde fehlt am ersten
+        // Wort. Der Abstand ist grosszuegig: zwischen dem Abbruch der Antwort
+        // und dem Anfang der Aufnahme liegen das Zumachen und das Aufmachen
+        // des Ports.
+        {
+            static bool    hoerte       = false;
+            static int64_t stimme_bis   = 0;
+            if (tts.spricht()) stimme_bis = esp_timer_get_time();
+
+            const bool hoert = listener.listening();
+            if (hoert && !hoerte
+                && esp_timer_get_time() - stimme_bis < 500000) {
+                listener.nachklang_erwarten();
+            }
+            hoerte = hoert;
         }
 
         const int64_t t_b = esp_timer_get_time();
@@ -1313,6 +1324,13 @@ static void audio_task(void *)
         } else {
             t_c = esp_timer_get_time();
             listener.feed(block, kReadFrames);
+
+            // Solange die Taste nicht gedrueckt ist, hoert das Weckwort zu.
+            // Waehrend einer Aufnahme nicht: wer schon spricht, muss nicht
+            // geweckt werden.
+            if (!listener.listening()) {
+                wachwort::feed(block, kReadFrames, kSampleRate);
+            }
 
             int16_t lo[kColumnsPerRead];
             int16_t hi[kColumnsPerRead];
