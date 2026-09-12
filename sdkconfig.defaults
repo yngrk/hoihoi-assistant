@@ -23,3 +23,9 @@ CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y
 
 CONFIG_FREERTOS_HZ=1000
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# --- CPU-Takt: 240 MHz statt der IDF-Vorgabe von 160 MHz ---
+# Der S3 kann 240 MHz. Fuer den Bring-up war der Unterschied egal, fuer die
+# Audioverarbeitung (Mikrofon, Keyword-Erkennung) ist er es nicht.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240

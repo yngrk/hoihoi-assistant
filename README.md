@@ -42,6 +42,12 @@ damit derselben Minor-Serie, gegen die Waveshare seine Beispiele baut (5.5.1).
 `espressif32@7.x` läge bei IDF 6.1, wo etliche APIs entfernt wurden, die der
 übernommene Display-Treiber noch verwendet.
 
+Der CPU-Takt steht über `sdkconfig.defaults` auf 240 MHz statt der IDF-Vorgabe
+von 160 MHz. Achtung beim Ändern von `sdkconfig.defaults`: eine bereits erzeugte
+`sdkconfig.rlcd42` gewinnt gegen die Defaults, neue Werte greifen dann nicht.
+Dafür die Datei löschen — sie wird beim nächsten Build neu erzeugt und ist
+ohnehin nicht versioniert.
+
 ```bash
 pio run                  # bauen
 pio run -t upload        # flashen
@@ -59,6 +65,7 @@ PlatformIO selbst.
 ```
 src/main.cpp              Bring-up-Ablauf
 src/user_config.h         Pinbelegung
+src/gfx.h, src/gfx.cpp    Clippende Zeichenschicht über dem Treiber
 components/port_bsp/      ST7305-Treiber, unverändert von Waveshare übernommen
 sdkconfig.defaults        Flash-, PSRAM- und Konsolenkonfiguration
 partitions.csv            8 MB App-Partition
@@ -69,6 +76,14 @@ ESP-IDF-Beispiel `09_LVGL_V9_Test` und ist absichtlich unverändert, damit
 Updates von dort einfach nachgezogen werden können. Die Kommentare darin sind
 chinesisch.
 
+`DisplayPort::RLCD_SetPixel()` prüft seine Koordinaten nicht, und die
+Lookup-Tabelle hat eine fest auf 300 gesetzte Zeilenlänge: ein `x >= 400` liest
+hinter die Allokation, ein `y >= 300` still in die Zeile des nächsten `x`. Der
+Treiber ruft die Methode nirgends selbst auf, deshalb liegt die Prüfung in
+[src/gfx.h](src/gfx.h) statt im Treiber — so bleibt `port_bsp` byte-identisch
+zum Upstream und die Absicherung ist trotzdem lückenlos. **Nicht direkt
+`RLCD_SetPixel()` aufrufen, immer über `Canvas`.**
+
 ## Was der Bring-up prüft
 
 1. **Chip und Speicher** — Kerne, Revision, Flash-Größe, PSRAM-Initialisierung
@@ -77,9 +92,14 @@ chinesisch.
    Bausteine namentlich.
 3. **SHTC3-Messung** — Wakeup, Messbefehl, Auslesen, Sleep. Beweist, dass der
    Bus nicht nur ACKt, sondern plausible Werte liefert.
-4. **Display** — Testbild aus Rahmen, zwei Diagonalen und einem Schachbrett.
-   Der Rahmen prüft die Ränder, die Diagonalen die Adressierung, das Schachbrett
-   die Bit-Packung innerhalb eines Bytes.
+4. **Display** — Testbild aus Rahmen, zwei Diagonalen, einem asymmetrischen
+   Marker links oben und einem Schachbrett. Der Rahmen prüft die Ränder (er
+   liegt exakt auf Zeile 0/299 und Spalte 0/399 — auf Hardware verifiziert, dort
+   verdeckt keine Blende etwas), die Diagonalen die Adressierung, das
+   Schachbrett die Bit-Packung innerhalb eines Bytes, der Marker die
+   Orientierung: die anderen Elemente sind symmetrisch und würden eine
+   Spiegelung nicht verraten. Danach elf Zeichenaufrufe mit Koordinaten
+   außerhalb der Fläche als Selbsttest der Bereichsprüfung.
 5. **Tasten und Batterie** — Dauerschleife, alle zwei Sekunden ein Log.
 
 ## Offene Punkte

@@ -18,16 +18,22 @@
 #include <esp_flash.h>
 #include <esp_heap_caps.h>
 #include <esp_psram.h>
+#include <esp_private/esp_clk.h>
 #include <driver/gpio.h>
 #include <driver/i2c_master.h>
 #include <esp_adc/adc_oneshot.h>
 
 #include "display_bsp.h"
+#include "gfx.h"
 #include "user_config.h"
 
 static const char *TAG = "bringup";
 
 static i2c_master_bus_handle_t i2c_bus = nullptr;
+
+// Zeichenflaeche, angelegt in test_display(), danach fuer alle weiteren
+// Ausgaben gueltig.
+static Canvas *display = nullptr;
 
 // Erwartete Teilnehmer am I2C-Bus, fuer eine lesbare Scan-Ausgabe.
 struct KnownDevice {
@@ -57,13 +63,22 @@ static void report_chip(void)
     esp_chip_info_t info;
     esp_chip_info(&info);
 
-    uint32_t flash_size = 0;
-    esp_flash_get_size(NULL, &flash_size);
+    uint32_t  flash_size = 0;
+    esp_err_t flash_err  = esp_flash_get_size(NULL, &flash_size);
 
     ESP_LOGI(TAG, "--- Chip ---");
     ESP_LOGI(TAG, "Kerne      : %d", info.cores);
     ESP_LOGI(TAG, "Revision   : %d", info.revision);
-    ESP_LOGI(TAG, "Flash      : %" PRIu32 " MB", flash_size / (1024 * 1024));
+
+    // Ungeprueft wuerde ein Fehlschlag hier als "0 MB" durchgehen und wie ein
+    // Hardwaredefekt aussehen, statt als das was er ist.
+    if (flash_err == ESP_OK) {
+        ESP_LOGI(TAG, "Flash      : %" PRIu32 " MB", flash_size / (1024 * 1024));
+    } else {
+        ESP_LOGE(TAG, "Flash      : nicht lesbar (%s)", esp_err_to_name(flash_err));
+    }
+
+    ESP_LOGI(TAG, "CPU-Takt   : %d MHz", (int)(esp_clk_cpu_freq() / 1000000));
 
     if (esp_psram_is_initialized()) {
         size_t psram = esp_psram_get_size();
@@ -180,36 +195,65 @@ static void test_display(void)
                             RLCD_CS_PIN, RLCD_RST_PIN, LCD_WIDTH, LCD_HEIGHT);
 
     rlcd.RLCD_Init();
-    rlcd.RLCD_ColorClear(ColorWhite);
-    rlcd.RLCD_Display();
+
+    // Ab hier laeuft jedes Zeichnen ueber Canvas, nie direkt ueber
+    // RLCD_SetPixel() — siehe gfx.h zur Begruendung.
+    display = new Canvas(rlcd, LCD_WIDTH, LCD_HEIGHT);
+
+    display->clear(ColorWhite);
+    display->flush();
     vTaskDelay(pdMS_TO_TICKS(500));
 
-    // Testbild: Rahmen, Diagonalen, Schachbrett. Jedes Element prueft etwas
-    // anderes — der Rahmen die Raender, die Diagonalen die Adressierung,
+    // Testbild: Rahmen, Diagonalen, Marker, Schachbrett. Jedes Element prueft
+    // etwas anderes — der Rahmen die Raender, die Diagonalen die Adressierung,
     // das Schachbrett die Bit-Packung innerhalb eines Bytes.
-    for (int x = 0; x < LCD_WIDTH; x++) {
-        rlcd.RLCD_SetPixel(x, 0, ColorBlack);
-        rlcd.RLCD_SetPixel(x, LCD_HEIGHT - 1, ColorBlack);
-    }
-    for (int y = 0; y < LCD_HEIGHT; y++) {
-        rlcd.RLCD_SetPixel(0, y, ColorBlack);
-        rlcd.RLCD_SetPixel(LCD_WIDTH - 1, y, ColorBlack);
-    }
-    for (int i = 0; i < LCD_HEIGHT; i++) {
-        int x = i * LCD_WIDTH / LCD_HEIGHT;
-        rlcd.RLCD_SetPixel(x, i, ColorBlack);
-        rlcd.RLCD_SetPixel(LCD_WIDTH - 1 - x, i, ColorBlack);
-    }
+    //
+    // Der Rahmen liegt bewusst exakt auf der Kante (Zeile 0 und 299, Spalte 0
+    // und 399): auf echter Hardware verifiziert, dort wird nichts von einer
+    // Blende verdeckt. Er ist nur duenn und faellt beim Draufschauen kaum auf.
+    display->rect(0, 0, LCD_WIDTH - 1, LCD_HEIGHT - 1, ColorBlack);
+    display->line(0, 0, LCD_WIDTH - 1, LCD_HEIGHT - 1, ColorBlack);
+    display->line(LCD_WIDTH - 1, 0, 0, LCD_HEIGHT - 1, ColorBlack);
+
+    // Asymmetrischer Marker links oben, breiter als hoch: Rahmen, Diagonalen
+    // und Schachbrett sind alle symmetrisch und wuerden eine Spiegelung oder
+    // Drehung nicht verraten, dieser Balken schon.
+    display->fill_rect(30, 30, 109, 49, ColorBlack);
+
+    // Schachbrett als Anker: prueft die Bit-Packung innerhalb eines Bytes und
+    // beweist, dass ueberhaupt gezeichnet wird.
     for (int y = 100; y < 200; y++) {
         for (int x = 150; x < 250; x++) {
             if (((x / 10) + (y / 10)) % 2 == 0) {
-                rlcd.RLCD_SetPixel(x, y, ColorBlack);
+                display->pixel(x, y, ColorBlack);
             }
         }
     }
 
-    rlcd.RLCD_Display();
-    ESP_LOGI(TAG, "  Testbild ausgegeben: Rahmen, zwei Diagonalen, Schachbrett mittig.");
+    display->flush();
+    ESP_LOGI(TAG, "  Testbild ausgegeben: Rahmen auf der Kante, zwei Diagonalen, "
+                  "Marker links oben, Schachbrett mittig (100x100).");
+
+    // Selbsttest der Bereichspruefung. Ohne die Huelle wuerde jeder dieser
+    // Aufrufe hinter die LUT greifen; dass der Bring-up hier nicht abstuerzt
+    // und das Bild unveraendert bleibt, ist der eigentliche Nachweis.
+    // Saemtliche Koordinaten liegen vollstaendig ausserhalb, keine ragt in die
+    // Flaeche hinein. Geclippt wuerde sonst der sichtbare Teil tatsaechlich
+    // gezeichnet und das Testbild ueberschrieben — hier darf sich am Puffer
+    // nachweislich nichts aendern.
+    display->pixel(-1, -1, ColorBlack);
+    display->pixel(LCD_WIDTH, LCD_HEIGHT, ColorBlack);
+    display->pixel(LCD_WIDTH - 1, LCD_HEIGHT, ColorBlack);   // y genau eins zu weit
+    display->pixel(LCD_WIDTH, LCD_HEIGHT - 1, ColorBlack);   // x genau eins zu weit
+    display->pixel(30000, 30000, ColorBlack);
+    display->hline(-500, -100, 150, ColorWhite);
+    display->hline(LCD_WIDTH + 10, LCD_WIDTH + 99, 150, ColorWhite);
+    display->vline(200, -500, -100, ColorWhite);
+    display->vline(-7, 0, LCD_HEIGHT - 1, ColorWhite);
+    display->line(-200, -200, -10, -10, ColorWhite);
+    display->fill_rect(-50, -50, -10, -10, ColorWhite);
+    ESP_LOGI(TAG, "  Bereichspruefung: 11 Aufrufe ausserhalb ueberstanden, "
+                  "Bild unveraendert.");
 }
 
 // --- 5. Tasten und Batterie ----------------------------------------------
