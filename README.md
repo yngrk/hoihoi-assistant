@@ -66,6 +66,7 @@ PlatformIO selbst.
 src/main.cpp              Bring-up-Ablauf
 src/user_config.h         Pinbelegung
 src/gfx.h, src/gfx.cpp    Clippende Zeichenschicht über dem Treiber
+src/font5x7.h, .cpp       5×7-Bitmapfont, ASCII 0x20–0x7F
 src/audio.h, src/audio.cpp  Mikrofoneingang: ES7210 über I²C, Daten über I²S
 src/idf_component.yml     Abhängigkeit auf espressif/esp_codec_dev
 components/port_bsp/      ST7305-Treiber, unverändert von Waveshare übernommen
@@ -104,6 +105,38 @@ zum Upstream und die Absicherung ist trotzdem lückenlos. **Nicht direkt
    außerhalb der Fläche als Selbsttest der Bereichsprüfung.
 5. **Tasten und Batterie** — Zustand beider Tasten und Batterie-Rohwert.
 6. **Mikrofon** — läuft anschließend dauerhaft, siehe unten.
+
+## Bildaufbau
+
+Die Fläche ist in drei Bänder über die volle Breite geteilt, nach einem
+Figma-Entwurf mit den Anteilen 76 / 19 / 4 Prozent bei 4:3:
+
+| Band | Zeilen | Inhalt |
+|---|---|---|
+| stats | 0–227 | Kopfzeile, Umweltwerte links, Systemzustand rechts |
+| audio wave visualizer | 230–286 | Wellenbild, eine Sekunde Signal |
+| audio scale | 290–299 | Pegelbalken in dBFS |
+
+Text kommt aus einem eigenen 5×7-Bitmapfont, nicht aus LVGL. Bei einem Bit je
+Pixel gibt es nichts zu rastern und nichts zu glätten, und so bleiben die
+Bereichsprüfung und die TE-Synchronisation in `Canvas` unverändert gültig —
+LVGL brächte sein eigenes Puffer- und Auffrischmodell mit und würde beides
+verdrängen. `Canvas::text()` skaliert ganzzahlig; Hierarchie entsteht über die
+Zeichengröße, weil Graustufen für diesen Zweck fehlen. `0x7F` ist im Font kein
+DEL, sondern ein Gradzeichen.
+
+Die Umweltwerte liest ein eigener `stats_task` alle zwei Sekunden. Eine
+SHTC3-Messung wartet 16 ms — im Aufnahmetask kostete das Abtastwerte, im
+Anzeigetask ein halbes Bild. Die Werte stehen in ausgerichteten 32-Bit-Worten
+ohne Mutex: Schreiben und Lesen sind dort unteilbar, und ob die Anzeige einen
+Messwert ein Bild später übernimmt, ist bei zwei Sekunden Messabstand ohne
+Belang.
+
+Das Stats-Band wird in jedem Bild neu gezeichnet, obwohl sich sein Inhalt
+höchstens sekündlich ändert. Das ist bewusst: von den 37 ms Bildperiode gehen
+nur wenige Millisekunden fürs Zeichnen drauf, der Rest ist ohnehin Warten auf
+die Austastlücke. Eine Teilaktualisierung würde Zustand einführen, ohne Zeit zu
+sparen.
 
 ## Mikrofon-Visualisierung
 

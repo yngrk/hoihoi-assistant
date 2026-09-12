@@ -72,6 +72,18 @@ class Canvas {
     void rect(int x0, int y0, int x1, int y1, uint8_t color);
     void fill_rect(int x0, int y0, int x1, int y1, uint8_t color);
 
+    // Text aus dem 5x7-Bitmapfont. x/y ist die linke obere Ecke des ersten
+    // Zeichens, scale vergroessert ganzzahlig — bei einem Bit je Pixel gibt es
+    // keine Zwischenstufen, also auch keinen Grund fuer etwas anderes.
+    // Zeichen ausserhalb von 0x20..0x7F werden als '?' gezeichnet.
+    void text(int x, int y, const char *s, uint8_t color, int scale = 1);
+
+    // Breite in Pixeln, die text() belegen wuerde — fuer rechtsbuendige oder
+    // zentrierte Ausgabe, ohne die Zeichenbreite an der Aufrufstelle
+    // nachzurechnen.
+    static int text_width(const char *s, int scale = 1);
+    static int text_height(int scale = 1);
+
   private:
     static void te_isr(void *arg);
 

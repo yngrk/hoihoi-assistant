@@ -1,7 +1,11 @@
 #include "gfx.h"
 
+#include <string.h>
+
 #include <esp_attr.h>
 #include <esp_timer.h>
+
+#include "font5x7.h"
 
 Canvas::Canvas(DisplayPort &display, int width, int height)
     : d_(display), width_(width), height_(height)
@@ -149,5 +153,55 @@ void Canvas::fill_rect(int x0, int y0, int x1, int y1, uint8_t color)
 
     for (int y = y0; y <= y1; y++) {
         hline(x0, x1, y, color);
+    }
+}
+
+int Canvas::text_width(const char *s, int scale)
+{
+    if (s == nullptr) return 0;
+    if (scale < 1) scale = 1;
+    const int n = (int)strlen(s);
+    if (n == 0) return 0;
+    // Der Abstand hinter dem letzten Zeichen zaehlt nicht zur Textbreite.
+    return n * kFontAdvance * scale - scale;
+}
+
+int Canvas::text_height(int scale)
+{
+    if (scale < 1) scale = 1;
+    return kFontHeight * scale;
+}
+
+void Canvas::text(int x, int y, const char *s, uint8_t color, int scale)
+{
+    if (s == nullptr) return;
+    if (scale < 1) scale = 1;
+
+    int cx = x;
+    for (const char *p = s; *p != '\0'; ++p) {
+        unsigned char c = (unsigned char)*p;
+        if (c < 0x20 || c > 0x7F) c = '?';
+        const uint8_t *glyph = &kFont5x7[(c - 0x20) * kFontWidth];
+
+        // Frueher Ausstieg, sobald das Zeichen rechts herausgelaufen ist. Ohne
+        // das wuerde eine zu lange Zeichenkette die volle Laufzeit kosten und
+        // nur von pixel() verworfen.
+        if (cx >= width_) return;
+
+        for (int col = 0; col < kFontWidth; col++) {
+            const uint8_t bits = glyph[col];
+            if (bits == 0) continue;
+            for (int row = 0; row < kFontHeight; row++) {
+                if ((bits & (1 << row)) == 0) continue;
+                if (scale == 1) {
+                    pixel(cx + col, y + row, color);
+                } else {
+                    const int px = cx + col * scale;
+                    const int py = y + row * scale;
+                    fill_rect(px, py, px + scale - 1, py + scale - 1, color);
+                }
+            }
+        }
+        cx += kFontAdvance * scale;
     }
 }

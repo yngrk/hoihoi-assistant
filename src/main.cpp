@@ -136,53 +136,71 @@ static void scan_i2c(void)
 // --- 3. SHTC3 wirklich auslesen -------------------------------------------
 // Beweist, dass der Bus nicht nur ACKt, sondern plausible Daten liefert.
 
-static void read_shtc3(void)
+// Der Baustein bleibt nach dem Bring-up angemeldet, weil der Stats-Task ihn
+// zyklisch weiterliest. Zwischen den Messungen schlaeft er ohnehin.
+static i2c_master_dev_handle_t shtc3_dev = nullptr;
+
+static esp_err_t shtc3_open(void)
 {
-    ESP_LOGI(TAG, "--- SHTC3 ---");
+    if (shtc3_dev != nullptr) return ESP_OK;
 
     i2c_device_config_t dev_cfg = {};
     dev_cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
     dev_cfg.device_address  = 0x70;
     dev_cfg.scl_speed_hz    = 100000;
 
-    i2c_master_dev_handle_t dev = nullptr;
-    if (i2c_master_bus_add_device(i2c_bus, &dev_cfg, &dev) != ESP_OK) {
-        ESP_LOGE(TAG, "  Geraet konnte nicht angelegt werden.");
-        return;
-    }
+    return i2c_master_bus_add_device(i2c_bus, &dev_cfg, &shtc3_dev);
+}
+
+// Werte in Hundertsteln, damit die Anzeige ohne Gleitkomma formatieren kann.
+static esp_err_t shtc3_measure(int32_t *t_c100, int32_t *rh_100)
+{
+    if (shtc3_dev == nullptr) return ESP_ERR_INVALID_STATE;
 
     const uint8_t cmd_wakeup[]  = {0x35, 0x17};
     const uint8_t cmd_measure[] = {0x78, 0x66};  // Normalmodus, Temperatur zuerst
     const uint8_t cmd_sleep[]   = {0xB0, 0x98};
 
-    if (i2c_master_transmit(dev, cmd_wakeup, sizeof(cmd_wakeup), 100) != ESP_OK) {
-        ESP_LOGE(TAG, "  Wakeup fehlgeschlagen.");
-        i2c_master_bus_rm_device(dev);
-        return;
-    }
+    esp_err_t err = i2c_master_transmit(shtc3_dev, cmd_wakeup, sizeof(cmd_wakeup), 100);
+    if (err != ESP_OK) return err;
     vTaskDelay(pdMS_TO_TICKS(1));
 
-    if (i2c_master_transmit(dev, cmd_measure, sizeof(cmd_measure), 100) != ESP_OK) {
-        ESP_LOGE(TAG, "  Messbefehl fehlgeschlagen.");
-        i2c_master_bus_rm_device(dev);
-        return;
-    }
+    err = i2c_master_transmit(shtc3_dev, cmd_measure, sizeof(cmd_measure), 100);
+    if (err != ESP_OK) return err;
     vTaskDelay(pdMS_TO_TICKS(15));
 
     uint8_t raw[6] = {0};
-    if (i2c_master_receive(dev, raw, sizeof(raw), 100) == ESP_OK) {
-        uint16_t t_raw = (raw[0] << 8) | raw[1];
-        uint16_t h_raw = (raw[3] << 8) | raw[4];
-        float temperature = -45.0f + 175.0f * ((float)t_raw / 65535.0f);
-        float humidity    = 100.0f * ((float)h_raw / 65535.0f);
-        ESP_LOGI(TAG, "  Temperatur : %.2f C", temperature);
-        ESP_LOGI(TAG, "  Feuchte    : %.2f %%rH", humidity);
-    } else {
-        ESP_LOGE(TAG, "  Messwerte konnten nicht gelesen werden.");
+    err = i2c_master_receive(shtc3_dev, raw, sizeof(raw), 100);
+
+    // Schlafbefehl in jedem Fall, auch nach einem Lesefehler — sonst bliebe
+    // der Sensor wach und zieht dauerhaft Strom.
+    i2c_master_transmit(shtc3_dev, cmd_sleep, sizeof(cmd_sleep), 100);
+    if (err != ESP_OK) return err;
+
+    const uint16_t t_raw = (raw[0] << 8) | raw[1];
+    const uint16_t h_raw = (raw[3] << 8) | raw[4];
+    *t_c100 = (int32_t)(-4500 + (17500 * (int32_t)t_raw) / 65535);
+    *rh_100 = (int32_t)((10000 * (int32_t)h_raw) / 65535);
+    return ESP_OK;
+}
+
+static void read_shtc3(void)
+{
+    ESP_LOGI(TAG, "--- SHTC3 ---");
+
+    if (shtc3_open() != ESP_OK) {
+        ESP_LOGE(TAG, "  Geraet konnte nicht angelegt werden.");
+        return;
     }
 
-    i2c_master_transmit(dev, cmd_sleep, sizeof(cmd_sleep), 100);
-    i2c_master_bus_rm_device(dev);
+    int32_t t100 = 0, h100 = 0;
+    const esp_err_t err = shtc3_measure(&t100, &h100);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "  Temperatur : %.2f C", t100 / 100.0f);
+        ESP_LOGI(TAG, "  Feuchte    : %.2f %%rH", h100 / 100.0f);
+    } else {
+        ESP_LOGE(TAG, "  Messung fehlgeschlagen (%s)", esp_err_to_name(err));
+    }
 }
 
 // --- 4. Display -----------------------------------------------------------
@@ -305,14 +323,27 @@ static void init_inputs(void)
 
 static MicInput mic;
 
-// Aufteilung der Flaeche: oben das Wellenbild, unten ein Pegelbalken.
-static const int kScopeTop    = 2;
-static const int kScopeBottom = 247;
+// Aufteilung der Flaeche nach dem Entwurf: drei gestapelte Baender ueber die
+// volle Breite — Kennzahlen oben, Wellenbild in der Mitte, Pegelskala unten.
+// Die Anteile stammen aus dem Figma-Frame (76 / 19 / 4 Prozent bei 4:3) und
+// sind hier auf ganze Pixel gelegt; zwischen den Baendern liegt je eine
+// Trennlinie.
+static const int kStatsTop    = 0;
+static const int kStatsBottom = 227;
+
+static const int kScopeTop    = 230;
+static const int kScopeBottom = 286;
 static const int kScopeCenter = (kScopeTop + kScopeBottom) / 2;
 static const int kScopeHalf   = (kScopeBottom - kScopeTop) / 2;
 
-static const int kMeterTop    = 260;
-static const int kMeterBottom = 295;
+static const int kMeterTop    = 290;
+static const int kMeterBottom = 299;
+
+// Innerhalb des Stats-Bandes: Kopfzeile, dann zwei Spalten.
+static const int kHeaderBottom = 15;
+static const int kColLeftX     = 8;
+static const int kDividerX     = 200;
+static const int kColRightX    = 210;
 
 // 40 Frames je Spalte bei 16 kHz und 400 Spalten ergeben genau eine Sekunde
 // Signal ueber die volle Bildbreite.
@@ -336,10 +367,21 @@ static int32_t           shared_peak = 0;
 static const int32_t kScaleFloor = 1200;
 static int32_t       scope_scale = kScaleFloor;
 
-// Kennzahlen der Anzeige, nur fuer die Logzeile.
+// Kennzahlen der Anzeige, fuer die Logzeile und das Stats-Band.
 static volatile int32_t frame_us_sum = 0;
 static volatile int32_t frame_us_max = 0;
 static volatile int32_t frame_count  = 0;
+static volatile int32_t frames_per_s = 0;
+
+// Umwelt- und Systemwerte fuer das Stats-Band. Bewusst ohne Mutex: es sind
+// ausgerichtete 32-Bit-Worte, die ein Schreiber unteilbar setzt und ein Leser
+// unteilbar liest. Ein halb geschriebener Wert kann hier also nicht entstehen,
+// und ob die Anzeige einen Messwert ein Bild spaeter uebernimmt, spielt bei
+// zwei Sekunden Messabstand keine Rolle.
+static volatile int32_t env_temp_c100 = 0;
+static volatile int32_t env_hum_100   = 0;
+static volatile int32_t env_valid     = 0;
+static volatile int32_t battery_raw   = 0;
 
 static int sample_to_y(int32_t s, int32_t scale)
 {
@@ -357,10 +399,85 @@ static int level_to_width(int32_t amplitude)
     return (int)((db + 60.0f) / 60.0f * (LCD_WIDTH - 4));
 }
 
+// Festkommaausgabe mit einer Nachkommastelle. Ueber snprintf("%.1f") ginge es
+// auch, das zoege aber die Gleitkomma-Formatierung der libc in jedes Bild.
+static void fmt_tenths(char *buf, size_t n, int32_t v100, const char *unit)
+{
+    const bool    neg = (v100 < 0);
+    const int32_t a   = neg ? -v100 : v100;
+    snprintf(buf, n, "%s%d.%d%s", neg ? "-" : "",
+             (int)(a / 100), (int)((a / 10) % 10), unit);
+}
+
+// Beschriftung klein darueber, Wert gross darunter — bei einem Bit je Pixel
+// traegt die Groesse die Hierarchie, weil Graustufen dafuer fehlen.
+static void draw_field(int x, int y, const char *label, const char *value,
+                       int value_scale)
+{
+    display->text(x, y, label, ColorBlack, 1);
+    display->text(x, y + 12, value, ColorBlack, value_scale);
+}
+
+static void draw_stats(int32_t rms)
+{
+    char buf[32];
+
+    // Kopfzeile invers: der einzige Weg, auf dieser Anzeige etwas
+    // hervorzuheben, ohne Flaeche zu verschwenden.
+    display->fill_rect(0, kStatsTop, LCD_WIDTH - 1, kHeaderBottom, ColorBlack);
+    display->text(6, kStatsTop + 5, "HOIHOI SCREEN ASSISTANT", ColorWhite, 1);
+
+    display->vline(kDividerX, kHeaderBottom + 7, kStatsBottom - 6, ColorBlack);
+
+    // --- Linke Spalte: Umweltwerte, gross ---
+    if (env_valid) {
+        fmt_tenths(buf, sizeof(buf), env_temp_c100, "\x7F");   // Gradzeichen
+        draw_field(kColLeftX, 24, "TEMPERATUR", buf, 4);
+        fmt_tenths(buf, sizeof(buf), env_hum_100, "%");
+        draw_field(kColLeftX, 76, "FEUCHTE", buf, 4);
+    } else {
+        draw_field(kColLeftX, 24, "TEMPERATUR", "--", 4);
+        draw_field(kColLeftX, 76, "FEUCHTE", "--", 4);
+    }
+
+    // Pegel in dBFS gehoert fachlich zum Ton, steht aber als Zahl hier oben,
+    // weil das Wellenband dafuer keinen Platz hat.
+    const int32_t amp = (rms < 1) ? 1 : rms;
+    snprintf(buf, sizeof(buf), "%ddB", (int)(20.0f * log10f((float)amp / 32768.0f)));
+    draw_field(kColLeftX, 128, "PEGEL", buf, 4);
+
+    // --- Rechte Spalte: Systemzustand, klein ---
+    const int64_t up = esp_timer_get_time() / 1000000;
+    snprintf(buf, sizeof(buf), "%d:%02d:%02d",
+             (int)(up / 3600), (int)((up / 60) % 60), (int)(up % 60));
+    draw_field(kColRightX, 24, "LAUFZEIT", buf, 2);
+
+    snprintf(buf, sizeof(buf), "%d/s", (int)frames_per_s);
+    draw_field(kColRightX, 60, "BILDRATE", buf, 2);
+
+    const uint32_t te = display->te_period_us();
+    snprintf(buf, sizeof(buf), "%d Hz", (int)(te ? 1000000 / te : 0));
+    draw_field(kColRightX, 96, "PANEL", buf, 2);
+
+    snprintf(buf, sizeof(buf), "%d", (int)battery_raw);
+    draw_field(kColRightX, 132, "BATTERIE (ROH)", buf, 2);
+
+    snprintf(buf, sizeof(buf), "%s %s",
+             gpio_get_level(BOOT_BUTTON_PIN) ? "----" : "BOOT",
+             gpio_get_level(KEY_BUTTON_PIN) ? "---" : "KEY");
+    draw_field(kColRightX, 168, "TASTEN", buf, 2);
+}
+
 static void draw_scope(const int16_t *lo, const int16_t *hi, int head,
                        int32_t scale, int32_t rms, int32_t peak)
 {
     display->clear(ColorWhite);
+
+    draw_stats(rms);
+
+    // Trennlinien zwischen den drei Baendern.
+    display->hline(0, LCD_WIDTH - 1, kStatsBottom + 1, ColorBlack);
+    display->hline(0, LCD_WIDTH - 1, kScopeBottom + 2, ColorBlack);
 
     // Mittellinie gestrichelt, damit sie das Signal nicht verdeckt.
     for (int x = 0; x < LCD_WIDTH; x += 8) {
@@ -382,7 +499,7 @@ static void draw_scope(const int16_t *lo, const int16_t *hi, int head,
     display->rect(0, kMeterTop, LCD_WIDTH - 1, kMeterBottom, ColorBlack);
     const int w = level_to_width(rms);
     if (w > 0) {
-        display->fill_rect(2, kMeterTop + 3, 2 + w - 1, kMeterBottom - 3, ColorBlack);
+        display->fill_rect(2, kMeterTop + 2, 2 + w - 1, kMeterBottom - 2, ColorBlack);
     }
     // Spitzenwert als schmaler Strich, damit kurze Transienten sichtbar
     // bleiben, die der Balken schon wieder verlassen hat.
@@ -425,6 +542,30 @@ static void display_task(void *)
     }
 }
 
+// Sensortask: liest langsam veraenderliche Werte fuer das Stats-Band. Eigener
+// Task, weil eine SHTC3-Messung 16 ms wartet — im Aufnahmetask wuerde das
+// Abtastwerte kosten, im Anzeigetask ein halbes Bild.
+static void stats_task(void *)
+{
+    while (true) {
+        int32_t t100 = 0, h100 = 0;
+        if (shtc3_measure(&t100, &h100) == ESP_OK) {
+            env_temp_c100 = t100;
+            env_hum_100   = h100;
+            env_valid     = 1;
+        } else {
+            env_valid = 0;
+        }
+
+        int raw = 0;
+        if (adc_oneshot_read(adc_handle, ADC_CHANNEL_3, &raw) == ESP_OK) {
+            battery_raw = raw;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+}
+
 static void visualize_mic(void)
 {
     ESP_LOGI(TAG, "--- Mikrofon-Visualisierung ---");
@@ -450,6 +591,9 @@ static void visualize_mic(void)
     // Anzeige auf den zweiten Kern, damit das Zeichnen die Aufnahme nicht
     // verdraengt und umgekehrt.
     xTaskCreatePinnedToCore(display_task, "display", 4096, nullptr, 4, nullptr, 1);
+
+    // Niedrige Prioritaet: die Sensorwerte duerfen warten, Bild und Ton nicht.
+    xTaskCreatePinnedToCore(stats_task, "stats", 3072, nullptr, 2, nullptr, 0);
 
     static int16_t block[kReadFrames];
     int64_t        sum_sq    = 0;
@@ -511,9 +655,9 @@ static void visualize_mic(void)
         const int64_t now = esp_timer_get_time();
         if (now - last_log >= 1000000) {
             last_log = now;
-            int raw = 0;
-            adc_oneshot_read(adc_handle, ADC_CHANNEL_3, &raw);
+            const int raw = (int)battery_raw;   // gemessen im stats_task
             const int32_t fc = frame_count;
+            frames_per_s = fc;                  // fuer das Stats-Band
             ESP_LOGI(TAG,
                      "Pegel rms=%5d (%.1f dBFS)  peak=%5d  Skala=%5d  |  "
                      "Bild %d/%d ms, %d/s  |  TE %d us (%d Hz, %d Timeouts)"
