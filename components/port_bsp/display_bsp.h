@@ -15,7 +15,10 @@ enum ColorSelection {
 };
 
 class DisplayPort {
-  private:
+  // Einzige Abweichung vom Waveshare-Original: private -> protected. Damit
+  // kommt SyncDisplay (src/display_sync.h) an io_handle heran und kann das
+  // Ende der DMA-Uebertragung abwarten. Begruendung im README.
+  protected:
     esp_lcd_panel_io_handle_t io_handle = NULL;
     uint32_t            i2c_data_pdMS_TICKS = 0;
     uint32_t            i2c_done_pdMS_TICKS = 0;

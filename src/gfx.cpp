@@ -7,7 +7,7 @@
 
 #include "font5x7.h"
 
-Canvas::Canvas(DisplayPort &display, int width, int height)
+Canvas::Canvas(SyncDisplay &display, int width, int height)
     : d_(display), width_(width), height_(height)
 {
 }
@@ -76,7 +76,11 @@ void Canvas::flush()
             te_timeouts_++;
         }
     }
-    d_.RLCD_Display();
+
+    // Kehrt erst zurueck, wenn das DMA den Puffer fertig gelesen hat. Sonst
+    // wuerde der Aufrufer waehrend der laufenden Uebertragung schon wieder
+    // hineinzeichnen; siehe display_sync.h.
+    d_.send_and_wait();
 }
 
 void Canvas::pixel(int x, int y, uint8_t color)

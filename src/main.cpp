@@ -26,6 +26,7 @@
 #include <math.h>
 
 #include "display_bsp.h"
+#include "display_sync.h"
 #include "gfx.h"
 #include "audio.h"
 #include "user_config.h"
@@ -212,10 +213,18 @@ static void test_display(void)
     // Bewusst erst hier instanziiert, nicht als globales Objekt: der Treiber
     // allokiert Puffer, und zum Zeitpunkt globaler Konstruktoren laesst sich
     // ueber die Heap-Situation weniger sicher urteilen als hier in app_main.
-    static DisplayPort rlcd(RLCD_MOSI_PIN, RLCD_SCK_PIN, RLCD_DC_PIN,
+    static SyncDisplay rlcd(RLCD_MOSI_PIN, RLCD_SCK_PIN, RLCD_DC_PIN,
                             RLCD_CS_PIN, RLCD_RST_PIN, LCD_WIDTH, LCD_HEIGHT);
 
     rlcd.RLCD_Init();
+
+    // Vor dem ersten Bild: ohne diese Rueckmeldung wuerde der Zeichencode in
+    // den noch laufenden DMA-Transfer hineinschreiben.
+    const esp_err_t dma = rlcd.enable_transfer_wait();
+    if (dma != ESP_OK) {
+        ESP_LOGW(TAG, "  Kein DMA-Abschlusssignal (%s), Bild kann mischen.",
+                 esp_err_to_name(dma));
+    }
 
     // Ab hier laeuft jedes Zeichnen ueber Canvas, nie direkt ueber
     // RLCD_SetPixel() — siehe gfx.h zur Begruendung.
@@ -660,7 +669,7 @@ static void visualize_mic(void)
             frames_per_s = fc;                  // fuer das Stats-Band
             ESP_LOGI(TAG,
                      "Pegel rms=%5d (%.1f dBFS)  peak=%5d  Skala=%5d  |  "
-                     "Bild %d/%d ms, %d/s  |  TE %d us (%d Hz, %d Timeouts)"
+                     "Bild %d/%d ms, %d/s  |  TE %d us (%d Hz, %d Timeouts, DMA %d)"
                      "  |  BOOT=%s KEY=%s  Batterie=%d",
                      (int)rms, 20.0f * log10f(((float)rms + 1.0f) / 32768.0f),
                      (int)window_pk, (int)scope_scale,
@@ -671,6 +680,7 @@ static void visualize_mic(void)
                                ? 1000000 / display->te_period_us()
                                : 0),
                      (int)display->te_timeouts(),
+                     (int)display->dma_timeouts(),
                      gpio_get_level(BOOT_BUTTON_PIN) ? "offen" : "GEDRUECKT",
                      gpio_get_level(KEY_BUTTON_PIN) ? "offen" : "GEDRUECKT",
                      raw);

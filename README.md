@@ -66,18 +66,25 @@ PlatformIO selbst.
 src/main.cpp              Bring-up-Ablauf
 src/user_config.h         Pinbelegung
 src/gfx.h, src/gfx.cpp    Clippende Zeichenschicht über dem Treiber
+src/display_sync.h, .cpp  DisplayPort mit Rückmeldung über das DMA-Ende
 src/font5x7.h, .cpp       5×7-Bitmapfont, ASCII 0x20–0x7F
 src/audio.h, src/audio.cpp  Mikrofoneingang: ES7210 über I²C, Daten über I²S
 src/idf_component.yml     Abhängigkeit auf espressif/esp_codec_dev
-components/port_bsp/      ST7305-Treiber, unverändert von Waveshare übernommen
+components/port_bsp/      ST7305-Treiber von Waveshare, eine Zeile geändert
 sdkconfig.defaults        Flash-, PSRAM- und Konsolenkonfiguration
 partitions.csv            8 MB App-Partition
 ```
 
 Der Display-Treiber (`components/port_bsp/`) stammt aus Waveshares
-ESP-IDF-Beispiel `09_LVGL_V9_Test` und ist absichtlich unverändert, damit
-Updates von dort einfach nachgezogen werden können. Die Kommentare darin sind
-chinesisch.
+ESP-IDF-Beispiel `09_LVGL_V9_Test` und bleibt so nah am Original wie möglich,
+damit Updates von dort einfach nachgezogen werden können. Die Kommentare darin
+sind chinesisch.
+
+Genau eine Zeile weicht ab: `private:` in `display_bsp.h` ist zu `protected:`
+geworden. Damit kommt `SyncDisplay` an `io_handle` heran und kann sich das Ende
+der DMA-Übertragung melden lassen — siehe unten. Der Alternativweg wäre gewesen,
+den Treiber selbst umzubauen; eine Ableitung lässt sich bei einem Update
+dagegen einfach wieder daraufsetzen.
 
 `DisplayPort::RLCD_SetPixel()` prüft seine Koordinaten nicht, und die
 Lookup-Tabelle hat eine fest auf 300 gesetzte Zeilenlänge: ein `x >= 400` liest
@@ -165,6 +172,22 @@ schickt den Puffer über `esp_lcd_panel_io_tx_color` **asynchron** per DMA los,
 der Transfer von 15000 Byte bei 10 MHz dauert rund 12 ms und landete ohne
 Synchronisation quer über dem Bildaufbau des Panels — das wanderte von Bild zu
 Bild und war als Tearing sichtbar.
+
+Dieselbe Asynchronität hatte einen zweiten, davon unabhängigen Effekt: nach dem
+Absetzen lief der Zeichencode sofort weiter und überschrieb mit
+`RLCD_ColorClear()` denselben Puffer, aus dem das DMA noch zwölf Millisekunden
+lang las. Das Panel bekam die oberen Zeilen aus dem alten und die unteren aus
+dem neuen Bild. Bei 27 Hz und einem Wellenbild, das sich ohnehin bewegt, fällt
+das kaum auf — mit einem stehenden Stats-Band und erst recht bei 51 Hz wäre es
+deutlich geworden.
+
+`SyncDisplay` ([src/display_sync.h](src/display_sync.h)) hängt dafür den
+Rückruf `on_color_trans_done` an den Panel-IO und lässt `flush()` warten, bis
+der Puffer gelesen ist. Das kostet nichts: von den 37 ms Bildperiode gehen 12 ms
+für die Übertragung und rund 4 ms fürs Zeichnen weg, der Rest war ohnehin Warten
+auf die nächste Austastlücke. Auf Hardware gemessen bleibt die Bildrate bei
+27/s und die TE-Periode bei 36990 µs, ohne eine einzige ausbleibende
+Abschlussmeldung.
 
 Der Vollausschlag skaliert automatisch — sofort auf, langsam wieder zu, nie
 unter einen Sockelwert. Die Empfindlichkeit der Mikrofone ist nicht

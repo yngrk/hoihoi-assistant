@@ -28,11 +28,11 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 
-#include "display_bsp.h"
+#include "display_sync.h"
 
 class Canvas {
   public:
-    Canvas(DisplayPort &display, int width, int height);
+    Canvas(SyncDisplay &display, int width, int height);
 
     int width() const { return width_; }
     int height() const { return height_; }
@@ -40,7 +40,9 @@ class Canvas {
     void clear(uint8_t color);
 
     // Schiebt den Puffer zum Panel. Ist die TE-Synchronisation aktiv, wartet
-    // flush() vorher auf die naechste Austastluecke.
+    // flush() vorher auf die naechste Austastluecke — und anschliessend
+    // darauf, dass das DMA den Puffer fertig gelesen hat, siehe
+    // display_sync.h. Nach der Rueckkehr darf wieder gezeichnet werden.
     void flush();
 
     // --- Tearing-Effect-Synchronisation ----------------------------------
@@ -62,6 +64,9 @@ class Canvas {
 
     // Anzahl der flush()-Aufrufe, die vergeblich auf TE gewartet haben.
     uint32_t te_timeouts() const { return te_timeouts_; }
+
+    // Anzahl der Uebertragungen ohne Abschlussmeldung des DMA.
+    uint32_t dma_timeouts() const { return d_.dma_timeouts(); }
 
     // Alle Koordinaten sind int, nicht uint16_t: ein negativer Wert muss als
     // negativ erkennbar bleiben, statt vorher auf 65535 zu wrappen.
@@ -87,7 +92,7 @@ class Canvas {
   private:
     static void te_isr(void *arg);
 
-    DisplayPort     &d_;
+    SyncDisplay     &d_;
     int              width_;
     int              height_;
 
