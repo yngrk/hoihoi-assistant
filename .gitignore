@@ -1,0 +1,6 @@
+.pio/
+.vscode/
+sdkconfig
+sdkconfig.old
+sdkconfig.rlcd42
+build/
