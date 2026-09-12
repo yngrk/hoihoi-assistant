@@ -29,6 +29,7 @@
 #include "display_sync.h"
 #include "gfx.h"
 #include "audio.h"
+#include "listen.h"
 #include "user_config.h"
 
 static const char *TAG = "bringup";
@@ -38,6 +39,10 @@ static i2c_master_bus_handle_t i2c_bus = nullptr;
 // Zeichenflaeche, angelegt in test_display(), danach fuer alle weiteren
 // Ausgaben gueltig.
 static Canvas *display = nullptr;
+
+// Zuhoeren auf Tastendruck. Geschrieben wird nur im Aufnahmetask, gelesen
+// zusaetzlich im Anzeigetask — siehe listen.h zur Synchronisierung.
+static Listener listener;
 
 // Erwartete Teilnehmer am I2C-Bus, fuer eine lesbare Scan-Ausgabe.
 struct KnownDevice {
@@ -432,9 +437,29 @@ static void draw_stats(int32_t rms)
     char buf[32];
 
     // Kopfzeile invers: der einzige Weg, auf dieser Anzeige etwas
-    // hervorzuheben, ohne Flaeche zu verschwenden.
-    display->fill_rect(0, kStatsTop, LCD_WIDTH - 1, kHeaderBottom, ColorBlack);
-    display->text(6, kStatsTop + 5, "HOIHOI SCREEN ASSISTANT", ColorWhite, 1);
+    // hervorzuheben, ohne Flaeche zu verschwenden. Beim Zuhoeren kehrt sie
+    // sich noch einmal um — eine Aenderung ueber die volle Breite, die auch
+    // aus zwei Metern Abstand niemand uebersieht.
+    const bool    hoert = listener.listening();
+    const uint8_t grund = hoert ? ColorWhite : ColorBlack;
+    const uint8_t schrift = hoert ? ColorBlack : ColorWhite;
+
+    display->fill_rect(0, kStatsTop, LCD_WIDTH - 1, kHeaderBottom, grund);
+    if (hoert) {
+        // Ohne Rahmen liefe der helle Balken in die weisse Flaeche darunter.
+        display->rect(0, kStatsTop, LCD_WIDTH - 1, kHeaderBottom, ColorBlack);
+    }
+    display->text(6, kStatsTop + 5, "HOIHOI SCREEN ASSISTANT", schrift, 1);
+
+    if (hoert) {
+        const int32_t ms = listener.elapsed_ms();
+        snprintf(buf, sizeof(buf), "HOERT ZU  %d.%d s",
+                 (int)(ms / 1000), (int)((ms / 100) % 10));
+    } else {
+        snprintf(buf, sizeof(buf), "BEREIT");
+    }
+    display->text(LCD_WIDTH - 6 - Canvas::text_width(buf, 1), kStatsTop + 5,
+                  buf, schrift, 1);
 
     display->vline(kDividerX, kHeaderBottom + 7, kStatsBottom - 6, ColorBlack);
 
@@ -454,6 +479,19 @@ static void draw_stats(int32_t rms)
     const int32_t amp = (rms < 1) ? 1 : rms;
     snprintf(buf, sizeof(buf), "%ddB", (int)(20.0f * log10f((float)amp / 32768.0f)));
     draw_field(kColLeftX, 128, "PEGEL", buf, 4);
+
+    // Ergebnis des letzten Tastendrucks. Ohne diese Rueckmeldung waere nach
+    // dem Loslassen nicht zu sehen, ob ueberhaupt etwas angekommen ist.
+    if (listener.last_ms() > 0) {
+        const int32_t pk = (listener.last_peak() < 1) ? 1 : listener.last_peak();
+        snprintf(buf, sizeof(buf), "%d.%ds  %ddB",
+                 (int)(listener.last_ms() / 1000),
+                 (int)((listener.last_ms() / 100) % 10),
+                 (int)(20.0f * log10f((float)pk / 32768.0f)));
+    } else {
+        snprintf(buf, sizeof(buf), "--");
+    }
+    draw_field(kColLeftX, 180, "LETZTE AUFNAHME", buf, 2);
 
     // --- Rechte Spalte: Systemzustand, klein ---
     const int64_t up = esp_timer_get_time() / 1000000;
@@ -597,6 +635,17 @@ static void visualize_mic(void)
              (int)mic.sample_rate(), kFramesPerColumn, LCD_WIDTH,
              (float)LCD_WIDTH * kFramesPerColumn / mic.sample_rate());
 
+    const esp_err_t lerr = listener.begin(mic.sample_rate());
+    if (lerr == ESP_OK) {
+        ESP_LOGI(TAG, "  KEY (GPIO%d) schaltet das Zuhoeren ein und aus, "
+                      "hoechstens %d s am Stueck.",
+                 KEY_BUTTON_PIN, Listener::kMaxSeconds);
+    } else {
+        ESP_LOGW(TAG, "  Kein Aufnahmepuffer (%s) — KEY schaltet nur den "
+                      "Zustand um, ohne Mitschnitt.",
+                 esp_err_to_name(lerr));
+    }
+
     // Anzeige auf den zweiten Kern, damit das Zeichnen die Aufnahme nicht
     // verdraengt und umgekehrt.
     xTaskCreatePinnedToCore(display_task, "display", 4096, nullptr, 4, nullptr, 1);
@@ -616,6 +665,11 @@ static void visualize_mic(void)
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
+
+        // Taste und Mitschnitt zuerst: der Block liegt frisch vor, und die
+        // Abtastung im 20-ms-Takt ist zugleich die Entprellung.
+        listener.poll_key(gpio_get_level(KEY_BUTTON_PIN) == 0);
+        listener.feed(block, kReadFrames);
 
         int16_t lo[kColumnsPerRead];
         int16_t hi[kColumnsPerRead];

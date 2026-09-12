@@ -55,6 +55,19 @@ pio device monitor       # Log ansehen
 pio run -t upload -t monitor
 ```
 
+Auf Windows stürzt der Compiler gelegentlich ab, immer mit
+`internal compiler error: Segmentation fault` in `during RTL pass: ira`, meist
+in `esp_lcd/rgb/esp_lcd_panel_rgb.c`. Das ist kein Fehler im Projekt: derselbe
+Aufruf mit denselben Flags läuft einzeln zuverlässig durch, bei sechzehn
+gleichzeitigen Aufrufen scheitert im Mittel einer. Auslöser ist die
+Parallelität, nicht die Übersetzungseinheit. Ein voller Neubau läuft deshalb
+zuverlässiger mit gedrosselter Parallelität — nötig wird er, sobald sich
+`src/CMakeLists.txt` oder die Abhängigkeiten ändern:
+
+```bash
+pio run -j 6
+```
+
 Geflasht wird über den nativen USB-Serial/JTAG-Port des ESP32-S3
 (VID `303A` / PID `1001`). Der Port ist in `platformio.ini` fest auf `COM6`
 gesetzt; bei anderem Port dort anpassen oder die Zeilen entfernen, dann sucht
@@ -69,6 +82,7 @@ src/gfx.h, src/gfx.cpp    Clippende Zeichenschicht über dem Treiber
 src/display_sync.h, .cpp  DisplayPort mit Rückmeldung über das DMA-Ende
 src/font5x7.h, .cpp       5×7-Bitmapfont, ASCII 0x20–0x7F
 src/audio.h, src/audio.cpp  Mikrofoneingang: ES7210 über I²C, Daten über I²S
+src/listen.h, .cpp        Zuhören auf Tastendruck, Mitschnitt im PSRAM
 src/idf_component.yml     Abhängigkeit auf espressif/esp_codec_dev
 components/port_bsp/      ST7305-Treiber von Waveshare, eine Zeile geändert
 sdkconfig.defaults        Flash-, PSRAM- und Konsolenkonfiguration
@@ -199,6 +213,28 @@ Auf der Hardware gemessen: Grundrauschen bei −63 dBFS, Raumgeräusch um
 Zeichnen selbst kostet rund 4 ms, der Rest der 37 ms ist gewolltes Warten auf
 die Austastlücke.
 
+## Zuhören auf Tastendruck
+
+Die KEY-Taste (GPIO18) schaltet um: einmal drücken startet das Zuhören, noch
+einmal drücken beendet es. Kein Halten — wer spricht, soll die Hand frei haben.
+Spätestens nach zehn Sekunden endet die Aufnahme von selbst, damit das Gerät
+nicht unbemerkt weiterläuft.
+
+Sichtbar wird der Zustand über die Kopfzeile: sie kehrt sich beim Zuhören um,
+schwarz auf weiß statt weiß auf schwarz, und zeigt rechts die laufende Zeit. Auf
+einem reflektiven Schwarzweißdisplay ist eine Umkehrung über die volle Breite
+das deutlichste verfügbare Signal — Farbe, Helligkeit und Blinken fallen aus.
+Nach dem Ende steht Dauer und Spitzenpegel der letzten Aufnahme unter dem Pegel.
+
+Der Mitschnitt liegt im PSRAM (elf Sekunden bei 16 kHz, rund 350 KB) und bleibt
+nach dem Ende stehen. Das ist die Stelle, an der die Worterkennung ansetzen
+wird: sie bekommt einen sauber abgegrenzten Abschnitt statt eines endlosen
+Stroms und muss nicht selbst entscheiden, wann eine Äußerung beginnt.
+
+Die Taste hängt an keinem Interrupt. Der Aufnahmetask fragt sie alle 20 ms ab,
+wenn ohnehin ein Audioblock vorliegt, und dieser Abtastabstand ist zugleich die
+Entprellung.
+
 ## Offene Punkte
 
 - **Controller-Bezeichnung**: Waveshare und die ESPHome-Komponente nennen den
@@ -208,9 +244,18 @@ die Austastlücke.
 - **Batterie-ADC**: Das Teilerverhältnis am ADC ist nicht dokumentiert, deshalb
   wird bisher nur der Rohwert geloggt. Für eine Spannungsangabe muss der Faktor
   am Schaltplan oder empirisch bestimmt werden.
-- **Keyword-Erkennung**: Der Mikrofonpfad steht, die eigentliche
-  Schlüsselworterkennung fehlt noch. Die Visualisierung ist der erste Schritt
-  dorthin und belegt, dass brauchbares Signal ankommt.
+- **Weckwort „HoiHoi"**: zurückgestellt, ausgelöst wird vorerst über die Taste.
+  Für „HoiHoi" gibt es kein fertiges Modell: Espressifs WakeNet kennt ab Werk
+  nur Hi ESP, Alexa, Jarvis, Computer, Sophia und einige weitere, und ein
+  eigenes Weckwort ist dort ein kostenpflichtiger Dienst — mindestens 20 000
+  Sprachaufnahmen, zwei bis drei Wochen Training. MultiNet nimmt zwar eigene
+  Kommandos als Text an, setzt laut Doku aber zwingend ein WakeNet davor und
+  taugt nicht als eigenständiger Wortdetektor. Bleiben zwei Wege: ein auf die
+  eigene Stimme eingelernter Erkenner (MFCC plus DTW gegen selbst gesprochene
+  Vorlagen, sprecherabhängig, dafür ohne Lizenz und sofort machbar) oder ein
+  selbst trainiertes Modell nach Art von microWakeWord, das aus
+  TTS-erzeugten Beispielen entsteht und sprecherunabhängig arbeitet, dafür aber
+  eine Trainingspipeline außerhalb der Firmware braucht.
 - **Audioausgabe**: Der ES8311 ist noch nicht initialisiert, nur der ES7210 für
   die Aufnahme. Referenz dafür ist Waveshares Beispiel `07_Audio_Test`.
 - **microSD und RTC**: noch nicht angebunden.
