@@ -82,8 +82,7 @@ src/gfx.h, src/gfx.cpp    Clippende Zeichenschicht über dem Treiber
 src/display_sync.h, .cpp  DisplayPort mit Rückmeldung über das DMA-Ende
 src/font5x7.h, .cpp       5×7-Bitmapfont, ASCII 0x20–0x7F plus ä ö ü ß
 src/audio.h, src/audio.cpp  ES7210 und ES8311 im Vollduplex an einem I²S-Port
-src/listen.h, .cpp        Zuhören auf Tastendruck, Mitschnitt im PSRAM
-src/logview.h, .cpp       ESP-Log zusätzlich auf das Display
+src/listen.h, .cpp        Aufnahme nach dem Weckwort, Mitschnitt im PSRAM
 src/net.h, .cpp           WLAN im Stationsbetrieb
 src/cfg.h, .cpp           Zugangsdaten im NVS
 src/prov.h, .cpp          Einrichtung über BLE
@@ -227,41 +226,57 @@ Auf der Hardware gemessen: Grundrauschen bei −63 dBFS, Raumgeräusch um
 Zeichnen selbst kostet rund 4 ms, der Rest der 37 ms ist gewolltes Warten auf
 die Austastlücke.
 
-## Zuhören auf Tastendruck
+## Zuhören, wenn das Weckwort gefallen ist
 
-Die KEY-Taste (GPIO18) ist eine Sprechtaste: drücken und **halten** nimmt auf,
-loslassen beendet. Damit bestimmt der Sprecher Anfang und Ende selbst, und es
-kann kein Zustand offen stehen bleiben, den niemand bemerkt hat — der Fall, den
-ein Umschalter zwangsläufig mitbringt.
+Die KEY-Taste war eine Sprechtaste: drücken und halten nahm auf, loslassen
+beendete. Das war bequem zu bauen, weil Anfang **und** Ende von außen kamen und
+keiner davon geraten werden musste. Jetzt kommt der Anfang vom Weckwort — und
+das Ende hat damit niemanden mehr, der es sagt.
 
-Die Zehn-Sekunden-Schranke bleibt trotzdem, denn der Puffer ist endlich. Sie
-ist ein Netz, kein Bedienelement: greift sie, endet die Aufnahme, und die Taste
-wird erst nach dem Loslassen wieder scharf. Der Puffer fasst elf Sekunden, also
-eine mehr als die Schranke — bei genau zehn liefe er voll, bevor die Uhr
-abgelaufen ist, und jede Aufnahme endete mit der falschen Begründung.
+Es kommt deshalb aus dem Pegel, nach derselben Regel wie die Wortabgrenzung des
+Weckworts, nur mit einer viel längeren Pause: hier soll ein ganzer Satz
+zusammenbleiben und nicht ein Wort.
 
-Der Mitschnitt liegt im PSRAM (elf Sekunden bei 24 kHz, rund 528 KB) und bleibt
-nach dem Ende stehen. Daran hängt die Transkription: sie bekommt einen sauber
+| | Wert | was passiert |
+|---|---|---|
+| `kWartenMs` | 3000 ms | so lange darf es nach dem Weckwort still bleiben, bevor aufgegeben wird |
+| `kStilleMs` | 900 ms | so lange Stille nach dem ersten Wort beendet den Satz |
+| `kMaxSeconds` | 10 s | die Obergrenze, ein Netz und kein Bedienelement |
+
+Der Bezugswert kommt nicht aus der Aufnahme selbst, sondern über
+`wachwort::ruhepegel()` von der Weckworterkennung. Die hat den Ruhepegel die
+ganze Zeit nachgeführt, während hier gerade gesprochen wird — wer in diesem
+Augenblick anfinge zu messen, mäße die Stimme und nicht den Raum.
+
+Der Puffer fasst elf Sekunden, also eine mehr als die Schranke — bei genau zehn
+liefe er voll, bevor die Uhr abgelaufen ist, und jede Aufnahme endete mit der
+falschen Begründung. Er liegt im PSRAM (rund 528 KB bei 24 kHz) und bleibt nach
+dem Ende stehen. Daran hängt die Transkription: sie bekommt einen sauber
 abgegrenzten Abschnitt statt eines endlosen Stroms, und weil alles im Puffer
-steht, geht auch nichts verloren, während die Verbindung noch aufgebaut wird.
+steht, geht nichts verloren, während die Verbindung noch aufgebaut wird.
 
-Die Taste hängt an keinem Interrupt. Der Aufnahmetask fragt sie alle 20 ms ab,
-wenn ohnehin ein Audioblock vorliegt, und dieser Abtastabstand ist zugleich die
-Entprellung. Zwei Abfragen ohne Kontakt gelten als Loslassen — ein einzelner
-Prellimpuls während des Haltens schnitte sonst mitten im Wort ab.
+Eine Aufnahme unter 200 ms wird gar nicht erst abgeschickt. Solange eine Taste
+sie startete, gab es diesen Fall praktisch nicht — wer drückt, sagt auch etwas.
+Das Weckwort löst dagegen von selbst aus und gelegentlich ins Leere; die
+Gegenseite beantwortet einen Puffer unter 100 ms mit einem Fehler, und der sähe
+im Log aus, als sei die Erkennung gestört.
+
+Was der Taste bleibt, ist der Notausgang. Während einer Antwort ist das
+Mikrofon zu, weil der Lautsprecher denselben I²S-Port belegt — das Gerät ist in
+dieser Zeit taub, und ohne Taste müsste man eine Antwort, die in die falsche
+Richtung läuft, bis zum Ende anhören. KEY bricht sie ab, sonst nichts.
 
 ### Was vorne und hinten abgeschnitten wird
 
-Hinten fallen von jeder Aufnahme 60 ms weg, vorne nur manchmal. Beides ist kein
-Sicherheitsabstand, sondern die Antwort auf gemessene Störungen — und die vorne
-war lange falsch verstanden.
+Vorne fällt von einer Aufnahme manchmal etwas weg, hinten nichts mehr. Beides
+ist kein Sicherheitsabstand, sondern die Antwort auf gemessene Störungen — und
+die vorne war lange falsch verstanden.
 
-Das Loslassen der Taste knackt, und der Knacks ist **lauter als jedes
-gesprochene Wort**: vor dem Schnitt lag die Spitze einer Aufnahme bei rund
-14000 Zählern, danach bei 2700 bis 4200. Gesprochen wird dort ohnehin nicht,
-die Taste geht gerade hoch. Wer bis zum letzten Moment durchspricht, verliert
-die letzte Silbe — dann ist `kTailMs` in [src/listen.h](src/listen.h) die
-Stellschraube.
+Hinten fielen früher 60 ms weg: das Loslassen der Taste knackte, und der Knacks
+war **lauter als jedes gesprochene Wort** — vor dem Schnitt lag die Spitze einer
+Aufnahme bei rund 14000 Zählern, danach bei 2700 bis 4200. Ohne Taste gibt es
+diesen Knacks nicht mehr. Eine Aufnahme endet jetzt in 900 ms Stille, und darin
+ist nichts abzuschneiden.
 
 Vorne fielen anfangs pauschal 120 ms weg, mit derselben Begründung: der ES7210
 setze beim Einschalten einen Einschwinger ab. Die Spitzenwerte der ersten
@@ -273,8 +288,8 @@ nach Wiedergabe  30432 32767  16851  13575   5920   2885
 ```
 
 Der „Einschwinger" ist keine Eigenschaft des Wandlers, sondern der
-Lautsprecher, der ins Mikrofon nachklingt. Er entsteht nur, wenn die Taste eine
-laufende Antwort unterbricht. Aus der Ruhe heraus gibt es nichts abzuschneiden
+Lautsprecher, der ins Mikrofon nachklingt. Er entsteht nur, wenn eine Aufnahme
+unmittelbar auf eine Antwort folgt. Aus der Ruhe heraus gibt es nichts abzuschneiden
 — die 120 ms waren dort das erste Wort. Und im anderen Fall waren sie zu wenig:
 bei 2885 gegen 4347 Spitze im Nutzsignal lag der Rest noch in derselben
 Größenordnung wie die Sprache.
@@ -346,17 +361,16 @@ Das Fehlerbild war entsprechend: die erste Aufnahme lief, jede weitere lieferte
 Wiedergabe hatte dem Mikrofon den Takt abgedreht. Mit einem gemeinsamen
 Datenobjekt: sechs Aufnahmen, sechs Wiedergaben, kein Lesefehler.
 
-### Mikrofon nur bei Tastendruck
+### Wann das Mikrofon offen ist
 
 Der ES7210 wird in `MicInput::start()` geöffnet und in `stop()` wieder
-geschlossen, nicht einmalig beim Hochfahren. Zwischen den Aufnahmen
-digitalisiert er nichts. Das Öffnen kostet gemessen 26 bis 53 ms und fällt beim
-Tastendruck nicht auf; im Log steht `MIK=AN` beziehungsweise `MIK=aus`.
+geschlossen, nicht einmalig beim Hochfahren. Das Öffnen kostet gemessen 26 bis
+53 ms; im Log steht `MIK=AN` beziehungsweise `MIK=aus`.
 
-Das ist eine Etappenentscheidung, kein Grundsatz: das fertige Gerät soll auf
-ein Weckwort hören und muss dafür dauerhaft digitalisieren. Solange es das noch
-nicht tut, ist „das Mikrofon ist zu" die ehrlichere Aussage — und sie ist an
-derselben Stelle im Code ablesbar, an der es später aufgeht.
+Lange stand er nur während einer Aufnahme offen. Das war eine
+Etappenentscheidung und ist mit dem Weckwort hinfällig geworden: wer auf ein
+Wort hören will, muss dauerhaft digitalisieren. Zu ist der Wandler jetzt nur
+noch, solange der Lautsprecher den Port braucht — siehe unten.
 
 Die Verstärkung steht auf 37,5 dB, dem Maximum des ES7210 (0 bis 33 dB in
 Dreierschritten, dann 34,5, 36, 37,5). Sie anzuheben hat den Störabstand nicht
@@ -378,7 +392,7 @@ genau so klang es.
 ### Die Übergabe des Ports zwischen Stimme und Mikrofon
 
 Beide Wandler hängen an *einer* Datenschnittstelle, und `esp_codec_dev` führt
-darin Buch, welche Richtung läuft. Wer während einer Antwort die Sprechtaste
+darin Buch, welche Richtung läuft. Wer während einer Antwort die KEY-Taste
 drückt, lässt beide im selben Augenblick daran drehen: das Mikrofon öffnet den
 Empfangskanal, während die Stimme den Sendekanal zurückgibt. Im Mitschnitt
 stand das als
@@ -844,29 +858,81 @@ Das passt in die 60 ms des DMA-Rings — es gab keinen einzigen Stau, und das Bi
 lief durchgehend mit 27 bis 28 Bildern je Sekunde —, aber es wächst mit der Zahl
 der Vorlagen. Bei acht wäre es die Hälfte des Puffers.
 
-Offen sind damit noch die Schwelle samt dem eigentlichen Wecken, das dauerhafte
-Ablegen der Vorlagen im NVS und eine Messung der Fehlauslösungen über eine
-Stunde statt über eine halbe Minute.
+### Die Schwelle und das eigentliche Wecken
 
-## Log auf dem Display
+Die Schwelle steht bei **9,50**, also in der Mitte der Lücke. Ein Kandidat
+darunter startet die Aufnahme, und damit die ganze Kette bis zur gesprochenen
+Antwort. Die Taste löst nichts mehr aus.
 
-`esp_log_set_vprintf()` gibt den bisherigen Handler zurück. Damit lässt sich
-das Log *abzweigen* statt umzuleiten: der Hook reicht zuerst an den alten
-Handler weiter und legt sich danach eine Kopie in einen Ring von 40 Zeilen.
-Die serielle Diagnose bleibt dabei vollständig erhalten.
+Erste Runde mit der fertigen Kette, vier Vorlagen (440/460/480/440 ms):
 
-Das Log ist die Standardansicht, nicht die Kennzahlen — das Wellenband ist
-leer, solange das Mikrofon zu ist, und das ist die meiste Zeit. BOOT schaltet
-um; während der Einrichtung gewinnt immer die Kennzahlenansicht, weil nur dort
-Gerätename und Nachweis stehen.
+| Abstand | Ergebnis |
+|---|---|
+| 6,06 7,34 6,77 8,41 | geweckt, vier vollständige Runden bis zur Antwort |
+| 15,96 | abgelehnt |
+| — | ein Kandidat von 1000 ms fiel schon an der Längenschranke |
 
-Zwei Dinge waren dabei nicht offensichtlich. Der **`sys_evt`-Task hat 2304
-Byte Stack**, und der Hook läuft auch in ihm — deshalb ein Zwischenpuffer von
-160 Byte und nichts Größeres. Und der Pegel-Herzschlag schreibt 200 Zeichen je
-Sekunde; er füllt 28 Zeilen in einer halben Minute. Statt die Zeile zu
-streichen, kann `logview::mute()` einzelne Anfänge unterdrücken — im Log auf
-der seriellen Schnittstelle stehen sie weiter.
+Alle vier Treffer liegen unter 8,5, die nächstliegende Ablehnung bei 15,96 —
+kein Grenzfall in eine der beiden Richtungen. Die Aufnahme endete jedes Mal von
+selbst über die Stille, null Staus, 27 bis 28 Bilder je Sekunde.
 
+Zwei Beobachtungen aus derselben Runde, beide unangenehm genau:
+
+**Nach jeder Antwort steht ein Knacks mit Spitze 32767 im Log**, also
+Vollausschlag — der Augenblick, in dem der Lautsprecher den I²S-Port abgibt und
+das Mikrofon ihn übernimmt. Er wird als „zu kurz" verworfen und richtet keinen
+Schaden an, zieht aber den Ruhepegel kurz auf den Boden von 60 hoch. Beide
+Fehlversuche der Runde lagen unmittelbar hinter einer Antwort.
+
+**Vom letzten Wort bis zum ersten Ton der Antwort vergehen 3,4 bis 4,9 s.**
+Davon sind 900 ms die Stillefrist — das ist der Preis dafür, dass niemand mehr
+eine Taste loslässt. Kürzer geht, schneidet aber Denkpausen mitten im Satz ab.
+
+Ungetestet blieb bisher der Abbruch nach 3 s ohne ein Wort: jede Weckung wurde
+von echter Rede gefolgt.
+
+Offen bleiben das dauerhafte Ablegen der Vorlagen im NVS — nach jedem
+Einschalten ist das Gerät wieder leer — und eine Messung der Fehlauslösungen
+über eine Stunde statt über eine halbe Minute.
+
+## Was auf dem Display steht
+
+Das Log stand hier einmal, und es ist wieder verschwunden. Nicht aus
+Platzgründen: es beantwortete die falsche Frage. Wer vor dem Gerät steht und es
+zum Sprechen bringen will, sucht nicht nach der letzten Meldung, sondern nach
+dem nächsten Handgriff — und muss dabei sehen, ob er überhaupt gehört wird. Das
+Log bleibt der seriellen Schnittstelle, wo es hingehört und wo es rückwärts
+lesbar ist.
+
+An seiner Stelle steht die **Weckwortansicht**. Sie zeigt je nach Zustand genau
+einen Handgriff, groß genug für das andere Ende des Tisches:
+
+| Zustand | was groß draufsteht |
+|---|---|
+| keine Vorlage | `BOOT LANG HALTEN` |
+| lernt ein | `SAG HOIHOI` und vier Kästen, gefüllt was steht |
+| bereit | `SAG HOIHOI` |
+
+Darunter, im Zustand „bereit", der Abstand des zuletzt bewerteten Wortes als
+Zahl und als Balken mit der Schwelle als Strich. Eine Zahl allein sagt nicht,
+ob 10,9 knapp daneben oder weit weg ist.
+
+Am Fuß läuft in jedem Zustand ein Pegelbalken mit — der einzige Teil des Bildes,
+der sich ständig bewegt, und genau das ist seine Aufgabe. Der Strich darin ist
+die Schwelle, ab der die Wortabgrenzung überhaupt hinhört; rechts daneben
+erscheint invers `WORT LAEUFT`, solange ein Wort durch die Abgrenzung läuft.
+
+Damit sind die drei Fälle auseinanderzuhalten, die von außen alle gleich
+aussehen — nämlich wie ein defektes Gerät:
+
+- **Balken bewegt sich nicht** → das Mikrofon hört nichts.
+- **Balken bleibt links vom Strich** → zu leise, wird nie als Wort betrachtet.
+- **`WORT LAEUFT` blinkt auf, es passiert nichts** → gehört, verglichen,
+  abgelehnt. Dann sagt die Abstandszahl, ob es knapp war.
+
+BOOT schaltet kurz gedrückt zu den Kennzahlen um und lang gehalten ins
+Einlernen; während der Einrichtung gewinnt immer die Kennzahlenansicht, weil nur
+dort Gerätename und Nachweis stehen.
 
 ## Offene Punkte
 
@@ -877,18 +943,13 @@ der seriellen Schnittstelle stehen sie weiter.
 - **Batterie-ADC**: Das Teilerverhältnis am ADC ist nicht dokumentiert, deshalb
   wird bisher nur der Rohwert geloggt. Für eine Spannungsangabe muss der Faktor
   am Schaltplan oder empirisch bestimmt werden.
-- **Weckwort „HoiHoi"**: zurückgestellt, ausgelöst wird vorerst über die Taste.
-  Für „HoiHoi" gibt es kein fertiges Modell: Espressifs WakeNet kennt ab Werk
-  nur Hi ESP, Alexa, Jarvis, Computer, Sophia und einige weitere, und ein
-  eigenes Weckwort ist dort ein kostenpflichtiger Dienst — mindestens 20 000
-  Sprachaufnahmen, zwei bis drei Wochen Training. MultiNet nimmt zwar eigene
-  Kommandos als Text an, setzt laut Doku aber zwingend ein WakeNet davor und
-  taugt nicht als eigenständiger Wortdetektor. Bleiben zwei Wege: ein auf die
-  eigene Stimme eingelernter Erkenner (MFCC plus DTW gegen selbst gesprochene
-  Vorlagen, sprecherabhängig, dafür ohne Lizenz und sofort machbar) oder ein
-  selbst trainiertes Modell nach Art von microWakeWord, das aus
-  TTS-erzeugten Beispielen entsteht und sprecherunabhängig arbeitet, dafür aber
-  eine Trainingspipeline außerhalb der Firmware braucht.
+- **Vorlagen im NVS**: das Einlernen liegt nur im RAM. Nach jedem Einschalten
+  ist das Gerät wieder leer und will neu eingelernt werden.
+- **Fehlauslösungen über eine Stunde**: bisher nur über eine halbe Minute
+  gemessen, und daraus lässt sich keine Rate je Stunde ableiten.
+- **Taub während der Antwort**: Mikrofon und Lautsprecher teilen sich den
+  I²S-Port, also hört das Weckwort nicht mit, solange gesprochen wird. Der
+  Notausgang bleibt die KEY-Taste.
 - **Stockende Anzeige beim ersten Handschlag**: laufen Erkennung, Chat und
   Stimme gleichzeitig durch ihren TLS-Aufbau, fällt die Bildrate für rund eine
   Sekunde auf 15/s, einzelne Bilder brauchen über eine Sekunde. Die Aufnahme
@@ -900,5 +961,5 @@ der seriellen Schnittstelle stehen sie weiter.
   vorgehalten, aber wie lange die Gegenseite eine unbenutzte
   Transkriptionssitzung offen lässt, steht nicht in der Doku. Fällt sie weg,
   baut das Gerät im Leerlauf neu auf — nachgemessen ist aber nicht, wie oft das
-  passiert und ob es je einen Tastendruck trifft.
+  passiert und ob es je eine Weckung trifft.
 - **microSD und RTC**: noch nicht angebunden.

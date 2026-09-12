@@ -32,7 +32,6 @@
 #include "font5x7.h"
 #include "audio.h"
 #include "listen.h"
-#include "logview.h"
 #include "nachtrag.h"
 #include "vergleich.h"
 #include "wachwort.h"
@@ -424,26 +423,32 @@ static const int kTextLines  = (kStatsBottom - kTextY) / kTextStep;   // 8
 // er gelesen ist.
 static const int64_t kResultHoldUs = 8 * 1000000;
 
-// Die Logansicht nimmt das ganze Bild. Das Wellenbild zeigt ohne laufendes
-// Mikrofon nur die Nulllinie, und das Mikrofon laeuft nur bei gedrueckter
-// Taste — waehrend einer Aufnahme uebernimmt aber ohnehin die
-// Aufnahmeansicht. Im Ruhezustand ist unter der Kopfzeile also nichts, was
-// dem Log den Platz streitig machen koennte.
-static const int kLogX    = 4;
-static const int kLogTop  = kHeaderBottom + 5;
-static const int kLogStep = 10;                 // 7 Pixel Schrift, 3 Luft
-static const int kLogCols = (LCD_WIDTH - 2 * kLogX) / kFontAdvance;   // 65
-static const int kLogRows = (LCD_HEIGHT - kLogTop) / kLogStep;
+// Die Weckwortansicht nimmt das ganze Bild. Sie beantwortet genau zwei
+// Fragen, und beide stellt man sich vor dem Geraet stehend: Was muss ich
+// jetzt tun? Und hoert es mich ueberhaupt?
+//
+// Die zweite ist die wichtigere. Ein Weckwort, das nicht anspringt, sieht von
+// aussen aus wie ein defektes Geraet — dabei sind es drei verschiedene Faelle:
+// zu leise, um als Wort zu gelten; laut genug, aber nicht als "HoiHoi"
+// erkannt; oder erkannt und knapp an der Schwelle vorbei. Der Pegelbalken
+// unten trennt den ersten Fall ab, die Abstandszahl die beiden anderen.
+static const int kWachX = 10;
 
-// Mehr Zeilen als Reihen braucht niemand zu holen: jede Zeile belegt
-// mindestens eine Reihe.
-static const int kLogFetch = (kLogRows < logview::kLines) ? kLogRows
-                                                          : logview::kLines;
+// Schriftgroessen: der Handgriff gross genug, um ihn vom anderen Ende des
+// Tisches zu lesen, die Messwerte klein genug, um daneben nicht zu draengen.
+static const int kWachGross = 5;   // 30 Pixel hoch
+static const int kWachMittel = 3;
+static const int kWachKlein  = 2;
 
-// Welche der beiden Ruheansichten gilt. Das Log steht vorn, weil es die
-// Frage beantwortet, die man vor dem Geraet tatsaechlich hat: was macht es
-// gerade? Die Kennzahlen sind einen Tastendruck entfernt.
-static volatile int log_ansicht = 1;
+// Der Pegelbalken am unteren Rand, in allen Zustaenden derselbe.
+static const int kPegelLabelY = 236;
+static const int kPegelTop    = 252;
+static const int kPegelBottom = 276;
+
+// Welche der beiden Ruheansichten gilt. Die Weckwortansicht steht vorn, weil
+// sie die Frage beantwortet, die man vor dem Geraet tatsaechlich hat. Die
+// Kennzahlen sind einen Tastendruck entfernt.
+static volatile int wach_ansicht = 1;
 
 // Antwortansicht: nimmt wie das Log das ganze Bild. Das Wellenbild zeigt
 // waehrenddessen nur die Nulllinie — das Mikrofon ist laengst wieder zu —,
@@ -551,8 +556,16 @@ static void status_text(char *buf, size_t n)
 {
     if (net::provisioning()) {
         snprintf(buf, n, "WLAN EINRICHTEN");
+    } else if (vergleich::lernt()) {
+        // Waehrend des Einlernens zaehlt nur, wie oft das Wort noch fehlt.
+        snprintf(buf, n, "EINLERNEN: %d VON %d",
+                 vergleich::eingelernt(), vergleich::kVorlagen);
+    } else if (vergleich::eingelernt() == 0) {
+        // Ohne Vorlagen weckt nichts. Das muss dranstehen, sonst sieht ein
+        // taubes Geraet genauso aus wie ein bereites.
+        snprintf(buf, n, "BOOT LANG: WECKWORT LERNEN");
     } else if (stt.phase() == Stt::Phase::Bereit) {
-        snprintf(buf, n, "BEREIT - KEY HALTEN");
+        snprintf(buf, n, "BEREIT - SAG HOIHOI");
     } else if (stt.phase() == Stt::Phase::Fehler) {
         snprintf(buf, n, "ERKENNUNG GESTOERT");
     } else {
@@ -560,47 +573,172 @@ static void status_text(char *buf, size_t n)
     }
 }
 
-// Logansicht: die juengsten Meldungen, neueste unten. Lange Zeilen laufen in
-// der naechsten Reihe weiter statt abgeschnitten zu werden — gerade bei
-// Fehlermeldungen steht das Entscheidende oft hinten.
-static void draw_log(void)
+// In dieser Ansicht steht fast alles mittig. Die Rechnung an sechs Stellen zu
+// wiederholen waere sechs Gelegenheiten, sie einmal falsch zu machen.
+static void text_mitte(int y, const char *s, int scale)
 {
-    static char zeilen[kLogFetch][logview::kCols + 1];
+    display->text((LCD_WIDTH - Canvas::text_width(s, scale)) / 2, y, s,
+                  ColorBlack, scale);
+}
 
-    const int n = logview::snapshot(&zeilen[0][0], kLogFetch);
+// Der Pegelbalken am Fuss der Weckwortansicht. Er ist der einzige Teil des
+// Bildes, der sich staendig bewegt, und genau das ist seine Aufgabe: er
+// beweist, dass das Mikrofon laeuft. Der Strich darin ist die Schwelle, ab der
+// die Wortabgrenzung ueberhaupt hinhoert — wer links davon bleibt, wird nie
+// als Wort betrachtet, egal wie deutlich er spricht.
+static void draw_pegel(int32_t rms)
+{
+    display->text(kWachX, kPegelLabelY, "PEGEL", ColorBlack, 1);
 
-    // Von hinten her so viele Zeilen nehmen, wie in die Flaeche passen. Die
-    // neueste Meldung ist die wichtigste und muss in jedem Fall aufs Bild,
-    // deshalb wird rueckwaerts gezaehlt und nicht vorwaerts gerechnet.
-    int erste  = n;
-    int reihen = 0;
-    while (erste > 0) {
-        const int len = (int)strlen(zeilen[erste - 1]);
-        int       r   = (len + kLogCols - 1) / kLogCols;
-        if (r < 1) r = 1;
-        if (reihen + r > kLogRows) break;
-        reihen += r;
-        erste--;
+    // Laeuft gerade ein Wort durch die Abgrenzung, steht es invers daneben.
+    // Das ist die unmittelbarste Rueckmeldung, die das Geraet geben kann:
+    // zwischen "es hoert mich nicht" und "es hoert mich, kennt das Wort aber
+    // nicht" verlaeuft hier die Grenze.
+    if (wachwort::im_wort()) {
+        const char *s = "WORT LAEUFT";
+        const int   w = Canvas::text_width(s, 1);
+        display->fill_rect(LCD_WIDTH - kWachX - w - 6, kPegelLabelY - 3,
+                           LCD_WIDTH - kWachX - 1, kPegelLabelY + 9, ColorBlack);
+        display->text(LCD_WIDTH - kWachX - w - 3, kPegelLabelY, s, ColorWhite, 1);
     }
 
-    char stueck[kLogCols + 1];
-    int  y = kLogTop;
+    display->rect(kWachX, kPegelTop, LCD_WIDTH - kWachX - 1, kPegelBottom,
+                  ColorBlack);
 
-    for (int i = erste; i < n; i++) {
-        const char *quelle = zeilen[i];
-        const int   len    = (int)strlen(quelle);
+    const int innen = LCD_WIDTH - 2 * kWachX - 4;
+    const int x0    = kWachX + 2;
 
-        for (int off = 0; off == 0 || off < len; off += kLogCols) {
-            int m = len - off;
-            if (m > kLogCols) m = kLogCols;
-            if (m < 0) m = 0;
-            memcpy(stueck, quelle + off, (size_t)m);
-            stueck[m] = ' ';
+    int w = level_to_width(rms) * innen / (LCD_WIDTH - 4);
+    if (w > innen) w = innen;
+    if (w > 0) {
+        display->fill_rect(x0, kPegelTop + 2, x0 + w - 1, kPegelBottom - 2,
+                           ColorBlack);
+    }
 
-            display->text(kLogX, y, stueck, ColorBlack, 1);
-            y += kLogStep;
+    // Die Schwellenmarke doppelt: als Zacken ueber dem Balken, wo sie immer
+    // sichtbar ist, und als Strich darin, der sich umfaerbt, sobald der Balken
+    // ihn ueberholt. Nur innen waere sie unsichtbar, sobald der Pegel sie
+    // erreicht — also genau dann, wenn sie interessant wird.
+    int m = level_to_width(wachwort::schwelle()) * innen / (LCD_WIDTH - 4);
+    if (m < 0)     m = 0;
+    if (m > innen) m = innen;
+
+    display->vline(x0 + m, kPegelTop - 6, kPegelTop - 1, ColorBlack);
+    display->vline(x0 + m, kPegelTop + 2, kPegelBottom - 2,
+                   (m < w) ? ColorWhite : ColorBlack);
+}
+
+// Die Weckwortansicht. Ein Zustand, ein Handgriff — und darunter die beiden
+// Zahlen, an denen sich ablesen laesst, warum nichts passiert.
+static void draw_weckwort(int32_t rms)
+{
+    char buf[48];
+
+    status_text(buf, sizeof(buf));
+    draw_header("WECKWORT - BOOT ZEIGT KENNZAHLEN", buf);
+
+    // --- Einlernen laeuft ---
+    if (vergleich::lernt()) {
+        text_mitte(40, "SAG HOIHOI", kWachGross);
+
+        // Vier Kaesten, gefuellt was steht. Eine Zahl allein ("2 von 4") muss
+        // gelesen werden; die Kaesten sieht man im Vorbeigehen.
+        const int fertig = vergleich::eingelernt();
+        const int breite = 72;
+        const int luecke = 16;
+        const int ganz   = vergleich::kVorlagen * breite
+                           + (vergleich::kVorlagen - 1) * luecke;
+        int       x      = (LCD_WIDTH - ganz) / 2;
+
+        for (int i = 0; i < vergleich::kVorlagen; i++) {
+            if (i < fertig) {
+                display->fill_rect(x, 110, x + breite - 1, 155, ColorBlack);
+            } else {
+                display->rect(x, 110, x + breite - 1, 155, ColorBlack);
+            }
+            x += breite + luecke;
         }
+
+        snprintf(buf, sizeof(buf), "NOCH %d MAL - MIT PAUSEN DAZWISCHEN",
+                 vergleich::kVorlagen - fertig);
+        text_mitte(175, buf, kWachKlein);
+
+        draw_pegel(rms);
+        return;
     }
+
+    // --- Noch nichts eingelernt ---
+    if (vergleich::eingelernt() == 0) {
+        text_mitte(36, "BOOT LANG", kWachGross);
+        text_mitte(80, "HALTEN", kWachGross);
+        text_mitte(146, "DANN VIERMAL HOIHOI SAGEN,", kWachKlein);
+        text_mitte(168, "MIT PAUSEN DAZWISCHEN", kWachKlein);
+
+        draw_pegel(rms);
+        return;
+    }
+
+    // --- Bereit ---
+    text_mitte(30, "SAG HOIHOI", kWachGross);
+    display->hline(kWachX, LCD_WIDTH - kWachX - 1, 80, ColorBlack);
+
+    display->text(kWachX, 90, "LETZTES WORT", ColorBlack, 1);
+
+    const int32_t d = vergleich::letzter_abstand();
+
+    if (vergleich::bewertet() == 0) {
+        text_mitte(118, "NOCH NICHTS GEHOERT", kWachMittel);
+    } else if (d < 0) {
+        // Kein Vergleich zustande gekommen: das Wort war laenger oder kuerzer
+        // als jede Vorlage. Das ist kein Beinahe-Treffer, sondern ein anderer
+        // Fall, und er gehoert anders beschriftet.
+        snprintf(buf, sizeof(buf), "%d MS - LAENGE PASST NICHT",
+                 (int)vergleich::letzte_dauer());
+        text_mitte(118, buf, kWachKlein);
+    } else {
+        const int schwelle100 = (int)(vergleich::kSchwelle * 100.0f);
+
+        snprintf(buf, sizeof(buf), "%d.%02d", (int)(d / 100), (int)(d % 100));
+        display->text(kWachX, 104, buf, ColorBlack, 4);
+
+        snprintf(buf, sizeof(buf), "SCHWELLE %d.%02d",
+                 schwelle100 / 100, schwelle100 % 100);
+        display->text(kWachX + 130, 116, buf, ColorBlack, kWachKlein);
+
+        // Balken von null bis kSkala100, mit der Schwelle als Strich. Die
+        // Zahl allein sagt nicht, ob 10,9 knapp daneben oder weit weg ist.
+        const int32_t kSkala100 = 1600;
+        const int     leiste_o  = 150;
+        const int     leiste_u  = 172;
+
+        display->rect(kWachX, leiste_o, LCD_WIDTH - kWachX - 1, leiste_u,
+                      ColorBlack);
+
+        const int innen = LCD_WIDTH - 2 * kWachX - 4;
+        const int x0    = kWachX + 2;
+
+        int w = (int)((int64_t)d * innen / kSkala100);
+        if (w > innen) w = innen;
+        if (w > 0) {
+            display->fill_rect(x0, leiste_o + 2, x0 + w - 1, leiste_u - 2,
+                               ColorBlack);
+        }
+
+        const int m = schwelle100 * innen / kSkala100;
+        display->vline(x0 + m, leiste_o - 6, leiste_o - 1, ColorBlack);
+        display->vline(x0 + m, leiste_o + 2, leiste_u - 2,
+                       (m < w) ? ColorWhite : ColorBlack);
+
+        text_mitte(178, vergleich::letzter_treffer() ? "LINKS VOM STRICH: ERKANNT"
+                                                     : "RECHTS VOM STRICH: FREMD",
+                   1);
+    }
+
+    snprintf(buf, sizeof(buf), "%u VON %u WOERTERN WAREN DAS WECKWORT",
+             (unsigned)vergleich::treffer(), (unsigned)vergleich::bewertet());
+    display->text(kWachX, 200, buf, ColorBlack, kWachKlein);
+
+    draw_pegel(rms);
 }
 
 static void draw_stats(int32_t rms)
@@ -608,7 +746,7 @@ static void draw_stats(int32_t rms)
     char buf[32];
 
     status_text(buf, sizeof(buf));
-    draw_header("KENNZAHLEN - BOOT ZEIGT LOG", buf);
+    draw_header("KENNZAHLEN - BOOT ZEIGT WECKWORT", buf);
 
     // Waehrend der Bereitstellung zaehlt nur eines: welches Geraet die App
     // suchen soll und welchen Nachweis sie verlangt. Temperatur und Bildrate
@@ -892,7 +1030,7 @@ static void poll_view_button(void)
         vergleich::einlernen();
     }
 
-    if (vorher == 0 && jetzt != 0 && !lang) log_ansicht = !log_ansicht;
+    if (vorher == 0 && jetzt != 0 && !lang) wach_ansicht = !wach_ansicht;
 
     vorher = jetzt;
 }
@@ -926,11 +1064,8 @@ static void draw_scope(const int16_t *lo, const int16_t *hi, int head,
     // Waehrend der Bereitstellung gewinnt die Kennzahlenansicht, egal was
     // eingestellt ist: dort und nur dort stehen Geraetename und Nachweis,
     // ohne die in der App nichts zu finden ist.
-    if (!aufnahme && log_ansicht && !net::provisioning()) {
-        char buf[32];
-        status_text(buf, sizeof(buf));
-        draw_header("LOG - BOOT ZEIGT KENNZAHLEN", buf);
-        draw_log();
+    if (!aufnahme && wach_ansicht && !net::provisioning()) {
+        draw_weckwort(rms);
         display->flush();
         return;
     }
@@ -964,9 +1099,10 @@ static void draw_scope(const int16_t *lo, const int16_t *hi, int head,
 
     // Ohne laufendes Mikrofon bleibt von der Kurve nur die Nulllinie. Die
     // Beschriftung sagt, warum — eine gerade Linie allein saehe aus wie ein
-    // Defekt.
+    // Defekt. Zu ist der Wandler nur noch waehrend einer Antwort: der
+    // Lautsprecher belegt denselben Port.
     if (!mic.running()) {
-        const char *s = "MIKROFON AUS - KEY GEDRUECKT HALTEN";
+        const char *s = "MIKROFON AUS - ANTWORT LAEUFT (KEY BRICHT AB)";
         const int   w = Canvas::text_width(s, 1);
         display->fill_rect((LCD_WIDTH - w) / 2 - 4, kScopeCenter - 6,
                            (LCD_WIDTH + w) / 2 + 3, kScopeCenter + 8, ColorWhite);
@@ -1143,12 +1279,16 @@ static bool visualize_mic(void)
 
     const esp_err_t lerr = listener.begin(mic.sample_rate());
     if (lerr == ESP_OK) {
-        ESP_LOGI(TAG, "  KEY (GPIO%d) gedrueckt halten nimmt auf, loslassen "
-                      "beendet; hoechstens %d s am Stueck.",
-                 KEY_BUTTON_PIN, Listener::kMaxSeconds);
+        ESP_LOGI(TAG, "  Das Weckwort startet die Aufnahme; sie endet nach "
+                      "%d ms Stille, spaetestens nach %d s. Ohne erstes Wort "
+                      "bricht sie nach %d ms ab.",
+                 (int)Listener::kStilleMs, Listener::kMaxSeconds,
+                 (int)Listener::kWartenMs);
+        ESP_LOGI(TAG, "  KEY (GPIO%d) bricht nur noch eine laufende Antwort ab.",
+                 KEY_BUTTON_PIN);
     } else {
-        ESP_LOGW(TAG, "  Kein Aufnahmepuffer (%s) — KEY schaltet nur den "
-                      "Zustand um, ohne Mitschnitt.",
+        ESP_LOGW(TAG, "  Kein Aufnahmepuffer (%s) — das Weckwort schaltet nur "
+                      "den Zustand um, ohne Mitschnitt.",
                  esp_err_to_name(lerr));
     }
 
@@ -1216,7 +1356,9 @@ static bool visualize_mic(void)
     // im Aufnahmetask darf nichts mehr belegt werden.
     const esp_err_t werr = wachwort::bereit();
     if (werr == ESP_OK) {
-        ESP_LOGI(TAG, "  Weckwort hoert mit.");
+        ESP_LOGI(TAG, "  Weckwort hoert mit. Noch keine Vorlage — BOOT lang "
+                      "halten und das Wort %d mal sagen.",
+                 (int)vergleich::kVorlagen);
     } else {
         ESP_LOGW(TAG, "  Weckwort aus (%s).", esp_err_to_name(werr));
     }
@@ -1264,18 +1406,16 @@ static void audio_task(void *)
     while (true) {
         const int64_t t_a = esp_timer_get_time();
 
-        // Die Taste zuerst, unabhaengig vom Mikrofon: solange nicht
-        // aufgenommen wird, gibt es keinen Audioblock, an dem sich die
-        // Abfrage aufhaengen koennte. Der 20-ms-Takt bleibt derselbe, und
-        // damit auch die Entprellung.
-        listener.poll_key(gpio_get_level(KEY_BUTTON_PIN) == 0);
-
-        // Wer die Sprechtaste drueckt, will sprechen und nicht zuhoeren: die
-        // laufende Antwort hoert auf. Sie muss den I2S-Port dabei auch
-        // wirklich freigeben — Mikrofon und Lautsprecher haengen an derselben
-        // Datenschnittstelle, und wer sie im selben Augenblick oeffnet und
-        // schliesst, bekommt eine Aufnahme mit null Frames.
-        if (listener.listening() && tts.spricht()) {
+        // Die KEY-Taste loest nichts mehr aus — das tut das Weckwort. Was ihr
+        // bleibt, ist der Notausgang: waehrend einer Antwort ist das Mikrofon
+        // zu, weil der Lautsprecher denselben I2S-Port belegt, und das Geraet
+        // ist in dieser Zeit taub. Ohne die Taste muesste man eine Antwort,
+        // die in die falsche Richtung laeuft, bis zum Ende anhoeren.
+        //
+        // Sie muss den Port dabei auch wirklich freigeben: wer ihn im selben
+        // Augenblick oeffnet und schliesst, bekommt eine Aufnahme mit null
+        // Frames.
+        if (gpio_get_level(KEY_BUTTON_PIN) == 0 && tts.spricht()) {
             tts.abbrechen();
         }
 
@@ -1351,11 +1491,18 @@ static void audio_task(void *)
             t_c = esp_timer_get_time();
             listener.feed(block, kReadFrames);
 
-            // Solange die Taste nicht gedrueckt ist, hoert das Weckwort zu.
-            // Waehrend einer Aufnahme nicht: wer schon spricht, muss nicht
-            // geweckt werden.
+            // Waehrend einer Aufnahme hoert das Weckwort nicht mit: wer schon
+            // spricht, muss nicht geweckt werden — und "HoiHoi" mitten in der
+            // Frage soll die laufende Aufnahme nicht von vorn beginnen.
+            //
+            // Der Ruhepegel, den es dabei nachfuehrt, gilt weiter: er stammt
+            // aus der Zeit unmittelbar vor dem Weckwort, und das ist die
+            // letzte, in der im Raum nachweislich niemand gesprochen hat.
             if (!listener.listening()) {
                 wachwort::feed(block, kReadFrames, kSampleRate);
+                if (wachwort::geweckt()) {
+                    listener.wecken(wachwort::ruhepegel());
+                }
             }
 
             int16_t lo[kColumnsPerRead];
@@ -1453,18 +1600,13 @@ static void audio_task(void *)
 
 extern "C" void app_main(void)
 {
-    // Vor der ersten eigenen Meldung: alles, was ab hier geloggt wird, soll
-    // spaeter auch auf dem Display stehen. Bootloader und fruehe
-    // IDF-Initialisierung liegen davor und bleiben der seriellen
-    // Schnittstelle vorbehalten.
-    logview::begin();
-
-    // Die eigene Taktmeldung bleibt der seriellen Schnittstelle vorbehalten.
-    // Sie ist rund zweihundert Zeichen lang und kommt jede Sekunde; auf dem
-    // Display haette nach einer halben Minute nichts anderes mehr Platz —
-    // und alles, was darin steht, zeigt die Kennzahlenansicht ohnehin.
-    logview::mute("Pegel rms=");
-
+    // Das Log stand frueher auch auf dem Display. Es ist dort wieder
+    // verschwunden, und zwar nicht aus Platzgruenden: es beantwortete die
+    // falsche Frage. Wer vor dem Geraet steht und es zum Sprechen bringen
+    // will, sucht nicht nach der letzten Meldung, sondern nach dem naechsten
+    // Handgriff — und muss dabei sehen, ob er ueberhaupt gehoert wird. Das
+    // Log bleibt der seriellen Schnittstelle, wo es hingehoert und wo es
+    // rueckwaerts lesbar ist.
     ESP_LOGI(TAG, "===== ESP32-S3-RLCD-4.2 Bring-up =====");
 
     // NVS zuerst: der WLAN-Treiber legt dort seine Kalibrierdaten ab und

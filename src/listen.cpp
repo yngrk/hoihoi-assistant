@@ -53,13 +53,25 @@ void Listener::start()
     skip_min_     = 0;
     started_ms_  = now_ms();
     last_frames_ = 0;
+    sprach_      = false;
+    still_ms_    = 0;
     listening_   = 1;
 
     // Nicht ESP_LOGI: dieser Aufruf kommt aus dem Aufnahmetask, und zwar in
-    // dem Augenblick, in dem die Taste heruntergeht. Eine blockierende
-    // Ausgabe hier schoebe das Oeffnen des Mikrofons um Zehntelsekunden nach
-    // hinten — genau das erste Wort.
-    nachtrag::schreiben('I', TAG, "Zuhoeren gestartet.");
+    // dem Augenblick, in dem das Weckwort erkannt ist. Eine blockierende
+    // Ausgabe hier schoebe alles Weitere um Zehntelsekunden nach hinten —
+    // genau das erste Wort.
+    nachtrag::schreiben('I', TAG, "Zuhoeren gestartet (Schwelle %d).",
+                        (int)schwelle_);
+}
+
+void Listener::wecken(int32_t ruhe)
+{
+    if (listening_ != 0) return;
+
+    if (ruhe < 1) ruhe = 1;
+    schwelle_ = ruhe * kFaktor + kBoden;
+    start();
 }
 
 void Listener::nachklang_erwarten()
@@ -76,12 +88,6 @@ void Listener::stop(const char *grund)
     // Transkriptionstask fuer einen Moment noch last_frames_ == 0 und
     // schickte das Ende der Aeusserung nicht mehr los.
     last_ms_ = now_ms() - started_ms_;
-
-    // Den Knacks vom Loslassen abschneiden, siehe kTailMs — aber nur, wenn
-    // danach noch etwas uebrig bleibt. Ein Tastendruck, der kuerzer war als
-    // der Schnitt, soll eine leere Aufnahme ergeben und keine negative Laenge.
-    const size_t tail = (size_t)rate_ * kTailMs / 1000;
-    fill_ = (fill_ > tail) ? (fill_ - tail) : 0;
 
     measure();
     last_frames_ = (int32_t)fill_;
@@ -137,39 +143,47 @@ void Listener::measure()
     last_noise_ = (rauschen > 0) ? rauschen : 0;
 }
 
-void Listener::poll_key(bool pressed)
+// Wann der Satz zu Ende ist. Die Taste hat das frueher beantwortet, indem
+// jemand sie losliess. Jetzt sagt es der Pegel, und zwar nach derselben Regel
+// wie bei der Wortabgrenzung des Weckworts — nur mit einer viel laengeren
+// Pause, denn hier soll ein ganzer Satz zusammenbleiben und nicht ein Wort.
+void Listener::ende_pruefen(const int16_t *pcm, size_t frames)
 {
-    const int32_t t = now_ms();
+    if (frames == 0 || rate_ == 0) return;
 
-    if (pressed) {
-        released_ = 0;
-        if (listening_ == 0 && !gesperrt_) {
-            start();
-        }
-    } else {
-        // Erst ein paar Abfragen ohne Tastendruck gelten als Loslassen. Ein
-        // einzelner Prellimpuls waehrend des Haltens schneidet sonst mitten
-        // im Wort ab.
-        if (released_ < kReleasePolls) released_++;
-        if (released_ >= kReleasePolls) {
-            gesperrt_ = false;
-            if (listening_ != 0) {
-                stop("Taste losgelassen");
-            }
-        }
+    int64_t summe = 0;
+    for (size_t i = 0; i < frames; i++) summe += (int64_t)pcm[i] * pcm[i];
+
+    const int32_t rms = (int32_t)sqrt((double)(summe / (int64_t)frames));
+    const int32_t ms  = (int32_t)(frames * 1000 / rate_);
+
+    if (rms > schwelle_) {
+        sprach_   = true;
+        still_ms_ = 0;
+        return;
     }
 
-    if (listening_ != 0 && (t - started_ms_) >= kMaxSeconds * 1000) {
-        stop("Zeit abgelaufen");
-        // Wer die Taste weiter haelt, bekommt keine zweite Aufnahme
-        // hinterher — erst loslassen.
-        gesperrt_ = true;
+    still_ms_ += ms;
+
+    // Vor dem ersten Wort gilt die laengere Frist: es darf jemand ueberlegen.
+    // Danach beendet die Pause die Aufnahme.
+    if (!sprach_) {
+        if (still_ms_ >= kWartenMs) stop("nichts gesagt");
+        return;
     }
+
+    if (still_ms_ >= kStilleMs) stop("Satz zu Ende");
 }
 
 void Listener::feed(const int16_t *pcm, size_t frames)
 {
     if (listening_ == 0 || buf_ == nullptr) return;
+
+    // Der Block, wie er hereinkam. Die Abbruchentscheidung unten arbeitet auf
+    // ihm und nicht auf dem, was am Ende im Puffer landet: sie fragt, ob es im
+    // Raum still ist, und darauf antwortet der ganze Block.
+    const int16_t *const roh   = pcm;
+    const size_t         roh_n = frames;
 
     // Den Nachklang des Lautsprechers vorne abschneiden, siehe kSkipMs.
     if (skip_ > 0) {
@@ -207,7 +221,10 @@ void Listener::feed(const int16_t *pcm, size_t frames)
             nachtrag::schreiben('I', TAG, "Nachklang je 20 ms: %s", zeile);
         }
 
-        if (frames == 0) return;
+        // Kein vorzeitiges Zurueck mehr, auch wenn vom Block nichts uebrig
+        // ist: die Stilleuhr unten laeuft ueber den ganzen Block, und wenn der
+        // Nachklang eine Sekunde lang alles auffrisst, ist genau das die
+        // Sekunde, die sie zaehlen muss.
     }
 
     size_t room = capacity_ - fill_;
@@ -219,9 +236,23 @@ void Listener::feed(const int16_t *pcm, size_t frames)
         live_frames_ = (int32_t)fill_;
     }
 
-    // Der Puffer reicht fuer kMaxSeconds, die Zeitschranke in poll_key() greift
+    // Der Puffer reicht fuer kMaxSeconds, die Zeitschranke unten greift
     // normalerweise zuerst. Trotzdem abfangen, statt still zu verwerfen.
     if (fill_ >= capacity_) {
         stop("Puffer voll");
+        return;
+    }
+
+    // Das Ende zuletzt, nach dem Mitschreiben: der Block, der die Stille voll
+    // macht, gehoert noch zur Aufnahme. Andersherum fehlte am Schluss jedes
+    // Mal ein Block, und das faellt genau dann auf, wenn der letzte Laut kurz
+    // war.
+    ende_pruefen(roh, roh_n);
+    if (listening_ == 0) return;
+
+    // Das Netz: der Puffer ist endlich, und ein Geraeusch, das nie leiser
+    // wird — ein Luefter, der anspringt — wuerde die Stilleuhr nie erreichen.
+    if (now_ms() - started_ms_ >= kMaxSeconds * 1000) {
+        stop("Zeit abgelaufen");
     }
 }

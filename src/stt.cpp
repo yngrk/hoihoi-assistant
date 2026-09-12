@@ -478,8 +478,26 @@ void Stt::run()
         // Rueckstand ohnehin auf, sobald die Sitzung steht; hier wird nur
         // gewartet, bis er durch ist.
         if (!aktiv && war_aktiv) {
-            abschluss_offen = true;
-            abschluss_frist = esp_timer_get_time() + kSitzungWarteUs;
+            // Eine leere Aufnahme hat nichts abzuschliessen. Solange eine
+            // Taste die Aufnahme startete, gab es sie praktisch nicht — wer
+            // drueckt, sagt auch etwas. Das Weckwort loest dagegen von selbst
+            // aus, und es loest gelegentlich ins Leere aus: dann steht die
+            // Aufnahme drei Sekunden offen und endet ohne ein Wort darin. Die
+            // Gegenseite beantwortet einen Puffer unter 100 ms mit einem
+            // Fehler, und der saehe im Log aus, als sei die Erkennung gestoert.
+            const size_t haben = quelle_->sample_count();
+            if (haben < (size_t)rate_ / 5) {
+                ESP_LOGI(TAG, "Nichts gesagt (%u Frames) — nichts zu erkennen.",
+                         (unsigned)haben);
+                if (client_ != nullptr && sitzung_ok_) {
+                    send_json("{\"type\":\"input_audio_buffer.clear\"}");
+                }
+                gesendet_ = 0;
+                phase_    = (int32_t)Phase::Bereit;
+            } else {
+                abschluss_offen = true;
+                abschluss_frist = esp_timer_get_time() + kSitzungWarteUs;
+            }
         }
 
         if (abschluss_offen) {

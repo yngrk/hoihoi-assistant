@@ -1,6 +1,6 @@
 idf_component_register(
     SRCS "main.cpp" "gfx.cpp" "audio.cpp" "font5x7.cpp" "display_sync.cpp"
-         "listen.cpp" "logview.cpp" "net.cpp" "verbindung.cpp" "stt.cpp"
+         "listen.cpp" "net.cpp" "verbindung.cpp" "stt.cpp"
          "chat.cpp" "tts.cpp" "cfg.cpp" "prov.cpp" "nachtrag.cpp"
          "wachwort.cpp" "merkmal.cpp" "vergleich.cpp"
     INCLUDE_DIRS "."

@@ -38,6 +38,24 @@ esp_err_t bereit();
 // PCM aus dem Aufnahmetask, blockweise. Darf nicht loggen — siehe nachtrag.h.
 void feed(const int16_t *pcm, size_t frames, uint32_t rate);
 
+// Genau einmal true, nachdem das Weckwort gefallen ist. Gesetzt wird es in
+// feed(), abgeholt im selben Task unmittelbar danach — deshalb reicht ein
+// einfaches Flag ohne Sperre.
+bool geweckt();
+
+// Der zuletzt gemessene Ruhepegel. Die Aufnahme, die auf das Weckwort folgt,
+// muss selbst entscheiden, wann der Satz zu Ende ist, und braucht dafuer
+// denselben Bezugswert — sie neu schaetzen zu lassen hiesse, in dem Augenblick
+// mit der Messung anzufangen, in dem gesprochen wird.
+int32_t ruhepegel();
+
+// Ab welchem Blockpegel gerade Sprache angenommen wird, und ob in diesem
+// Augenblick ein Wort laeuft. Beides nur fuer die Anzeige: wer vor dem Geraet
+// steht und nichts passiert, muss sehen koennen, ob es ihn schon zu leise
+// findet oder ob es ihn hoert und das Wort nur nicht kennt.
+int32_t schwelle();
+bool    im_wort();
+
 // Das Mikrofon war zu (der Lautsprecher hatte den Port). Danach stimmt weder
 // der Ruhepegel noch ein angefangenes Wort.
 void ruhe();

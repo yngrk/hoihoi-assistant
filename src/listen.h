@@ -1,23 +1,29 @@
 #pragma once
 
 // ---------------------------------------------------------------------------
-// Zuhoeren, solange die Taste gedrueckt ist.
+// Zuhoeren, nachdem das Weckwort gefallen ist.
 //
-// Die KEY-Taste wirkt wie eine Sprechtaste: druecken und halten nimmt auf,
-// loslassen beendet. Damit bestimmt der Sprecher Anfang und Ende selbst, und
-// es kann kein Zustand offen stehen bleiben, den niemand bemerkt hat.
+// Frueher war die KEY-Taste eine Sprechtaste: druecken und halten nahm auf,
+// loslassen beendete. Das war bequem zu bauen, weil Anfang und Ende beide von
+// aussen kamen und keiner davon geraten werden musste. Jetzt kommt der Anfang
+// vom Weckwort — und das Ende hat damit niemanden mehr, der es sagt.
 //
-// Die Zeitschranke kMaxSeconds bleibt trotzdem, denn der Puffer ist endlich.
-// Sie ist ein Netz, kein Bedienelement: greift sie, endet die Aufnahme, und
-// die Taste wird erst nach dem Loslassen wieder scharf.
+// Es kommt deshalb aus dem Pegel. Nach dem Weckwort laeuft eine Frist, in der
+// das erste Wort fallen muss; danach beendet eine Pause von kStilleMs die
+// Aufnahme. Beide Zahlen sind Kompromisse und beide fallen auf, wenn sie
+// falsch sitzen: zu kurz schneidet mitten im Satz ab, zu lang laesst das
+// Geraet nach jeder Frage herumstehen.
 //
-// Was aufgenommen wurde, bleibt nach dem Ende im Puffer stehen. Das ist die
-// Stelle, an der spaeter die Worterkennung ansetzt: sie bekommt einen sauber
-// abgegrenzten Abschnitt statt eines endlosen Stroms, und sie muss nicht
-// selbst entscheiden, wann eine Aeusserung beginnt.
+// Der Bezugswert dafuer kommt nicht von hier, sondern vom Weckwort: das hat
+// den Ruhepegel die ganze Zeit ueber nachgefuehrt, waehrend hier gerade
+// gesprochen wird. Wer in diesem Augenblick anfinge zu messen, maesse die
+// Stimme und nicht den Raum.
 //
-// Bewusst kein Interrupt an der Taste: der Aufnahmetask ruft poll_key() alle
-// 20 ms auf, wenn ohnehin ein Audioblock vorliegt.
+// Die Zeitschranke kMaxSeconds bleibt daneben stehen, denn der Puffer ist
+// endlich. Sie ist ein Netz, kein Bedienelement.
+//
+// Was aufgenommen wurde, bleibt nach dem Ende im Puffer stehen — dort holt es
+// die Erkennung ab.
 // ---------------------------------------------------------------------------
 
 #include <stddef.h>
@@ -61,24 +67,36 @@ class Listener {
     // einzelner Nadelimpuls verdirbt hoechstens ein Fenster, nicht die Messung.
     static const int32_t kNoiseMs = 100;
 
-    // Und dasselbe am hinteren Ende: das Loslassen der Taste knackt genauso
-    // wie das Einschalten des Wandlers, in den Messungen lag die Spitze jeder
-    // Aufnahme gut 20 ms vor Schluss. Gesprochen wird hier nicht mehr, die
-    // Taste geht ja gerade hoch.
-    static const int32_t kTailMs = 60;
+    // Am hinteren Ende wurde frueher ebenfalls geschnitten: das Loslassen der
+    // Taste knackte, und in den Messungen lag die Spitze jeder Aufnahme gut
+    // 20 ms vor Schluss. Ohne Taste gibt es diesen Knacks nicht mehr — eine
+    // Aufnahme endet jetzt in kStilleMs Stille, und darin ist nichts
+    // abzuschneiden.
 
-    // So viele Abfragen (je 20 ms) muss die Taste offen sein, bevor die
-    // Aufnahme endet. Ein einzelner Prellimpuls beim Halten wuerde sonst
-    // mitten im Wort abschneiden.
-    static const int32_t kReleasePolls = 2;
+    // So lange bleibt nach dem Weckwort Zeit, bis das erste Wort kommt. Wer
+    // "HoiHoi" sagt und dann ueberlegt, soll nicht ins Leere laufen; wer es
+    // versehentlich ausgeloest hat, soll nicht die vollen zehn Sekunden
+    // abwarten muessen.
+    static const int32_t kWartenMs = 3000;
+
+    // Und so lange Stille beendet den Satz. Eine Denkpause mitten in einem
+    // Satz ist selten laenger; eine Pause zwischen zwei Saetzen ist es fast
+    // immer. Wo die Grenze wirklich liegt, sagt erst der Gebrauch.
+    static const int32_t kStilleMs = 900;
+
+    // Dieselbe Regel wie bei der Wortabgrenzung des Weckworts: das Vierfache
+    // der Ruhe, aber nie unter einem festen Boden.
+    static const int32_t kFaktor = 4;
+    static const int32_t kBoden  = 60;
 
     // Legt den Aufnahmepuffer im PSRAM an. Schlaegt das fehl, bleibt der
     // Zustandswechsel trotzdem benutzbar, nur ohne Mitschnitt.
     esp_err_t begin(uint32_t sample_rate);
 
-    // Tastenzustand im Aufnahmetakt, true heisst gedrueckt (die Taste ist
-    // active low, das Umdrehen passiert beim Aufrufer).
-    void poll_key(bool pressed);
+    // Das Weckwort ist gefallen: ab jetzt wird aufgenommen. ruhe ist der
+    // Pegel, den die Weckwort-Erkennung zuletzt als Stille gemessen hat.
+    // Ein zweiter Aufruf waehrend einer laufenden Aufnahme tut nichts.
+    void wecken(int32_t ruhe);
 
     // PCM aus dem Aufnahmetask. Schreibt nur mit, solange zugehoert wird.
     void feed(const int16_t *pcm, size_t frames);
@@ -110,6 +128,11 @@ class Listener {
   private:
     void start();
     void stop(const char *grund);
+
+    // Entscheidet je Block, ob der Satz zu Ende ist. Bekommt den Ton so, wie
+    // er hereinkam — vor dem Abschneiden am Anfang, denn gemessen wird der
+    // Raum und nicht der Mitschnitt.
+    void ende_pruefen(const int16_t *pcm, size_t frames);
 
     int16_t *buf_      = nullptr;
     size_t   capacity_ = 0;      // Frames
@@ -146,6 +169,8 @@ class Listener {
     volatile int32_t last_frames_ = 0;
     volatile int32_t live_frames_ = 0;
 
-    int32_t released_ = kReleasePolls;   // Aufnahmen starten erst nach einem
-    bool    gesperrt_ = false;           // sauberen Loslassen der Taste
+    // Zustand der Abbruchentscheidung. Nur im Aufnahmetask angefasst.
+    int32_t schwelle_ = 0;       // ab hier gilt ein Block als Sprache
+    bool    sprach_   = false;   // seit dem Weckwort ist etwas gesagt worden
+    int32_t still_ms_ = 0;       // Stille am Stueck
 };

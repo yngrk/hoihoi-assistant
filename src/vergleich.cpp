@@ -22,6 +22,13 @@ int32_t s_ms[vergleich::kVorlagen];
 int     s_anzahl = 0;
 bool    s_lernt  = false;
 
+// Was zuletzt herauskam. Nur fuer die Anzeige, siehe vergleich.h.
+volatile int32_t  s_letzt_abstand = -1;
+volatile int32_t  s_letzt_ms      = 0;
+volatile int32_t  s_letzt_treffer = 0;
+volatile uint32_t s_bewertet      = 0;
+volatile uint32_t s_treffer       = 0;
+
 // Zwei Zeilen reichen: die Tafel wird spaltenweise abgeraeumt und nur die
 // letzte Spalte wird noch gebraucht.
 float s_zeile_a[vergleich::kMaxRahmen + 1];
@@ -83,6 +90,12 @@ esp_err_t vergleich::bereit()
 int  vergleich::eingelernt() { return s_anzahl; }
 bool vergleich::lernt()      { return s_lernt; }
 
+int32_t  vergleich::letzter_abstand() { return s_letzt_abstand; }
+int32_t  vergleich::letzte_dauer()    { return s_letzt_ms; }
+bool     vergleich::letzter_treffer() { return s_letzt_treffer != 0; }
+uint32_t vergleich::bewertet()        { return s_bewertet; }
+uint32_t vergleich::treffer()         { return s_treffer; }
+
 void vergleich::einlernen()
 {
     if (s_vorlage == nullptr) return;
@@ -133,9 +146,9 @@ void vergleich::selbsttest()
     heap_caps_free(a); heap_caps_free(b); heap_caps_free(ton);
 }
 
-void vergleich::kandidat(const float *folge, int32_t rahmen, int32_t ms)
+bool vergleich::kandidat(const float *folge, int32_t rahmen, int32_t ms)
 {
-    if (s_vorlage == nullptr || rahmen < 8) return;
+    if (s_vorlage == nullptr || rahmen < 8) return false;
     if (rahmen > kMaxRahmen) rahmen = kMaxRahmen;
 
     // Eingelernt wird nur nach ausdruecklichem Anstoss. Dauerhaft abgelegt
@@ -149,10 +162,10 @@ void vergleich::kandidat(const float *folge, int32_t rahmen, int32_t ms)
         if (s_anzahl >= kVorlagen) s_lernt = false;
         nachtrag::schreiben('I', TAG, "Vorlage %d von %d: %d ms, %d Rahmen.",
                             s_anzahl, (int)kVorlagen, (int)ms, (int)rahmen);
-        return;
+        return false;
     }
 
-    if (s_anzahl == 0) return;   // noch nichts eingelernt, nichts zu vergleichen
+    if (s_anzahl == 0) return false;   // nichts eingelernt, nichts zu vergleichen
 
     const int64_t t0 = esp_timer_get_time();
 
@@ -175,13 +188,31 @@ void vergleich::kandidat(const float *folge, int32_t rahmen, int32_t ms)
     const int us = (int)(esp_timer_get_time() - t0);
 
     if (welche < 0) {
+        s_letzt_abstand = -1;
+        s_letzt_ms      = ms;
+        s_letzt_treffer = 0;
+        s_bewertet      = s_bewertet + 1;
         nachtrag::schreiben('I', TAG, "  %d ms, %d Rahmen: Laenge passt zu keiner Vorlage.",
                             (int)ms, (int)rahmen);
-        return;
+        return false;
     }
 
-    nachtrag::schreiben('I', TAG, "  %d ms, %d Rahmen: Abstand %d.%02d zu Vorlage %d (%d von %d, %d us).",
+    // Der Abstand steht auch dann im Log, wenn er nicht reicht. Er ist die
+    // einzige Zahl, an der sich spaeter ablesen laesst, ob die Schwelle zu
+    // eng oder zu weit sitzt — ein blosses "erkannt / nicht erkannt" liesse
+    // genau das offen.
+    const bool treffer = (beste < kSchwelle);
+
+    s_letzt_abstand = (int32_t)(beste * 100.0f);
+    s_letzt_ms      = ms;
+    s_letzt_treffer = treffer ? 1 : 0;
+    s_bewertet      = s_bewertet + 1;
+    if (treffer) s_treffer = s_treffer + 1;
+
+    nachtrag::schreiben('I', TAG, "  %d ms, %d Rahmen: Abstand %d.%02d zu Vorlage %d (%d von %d, %d us).%s",
                         (int)ms, (int)rahmen,
                         (int)beste, (int)((beste - floorf(beste)) * 100.0f),
-                        welche + 1, geprueft, s_anzahl, us);
+                        welche + 1, geprueft, s_anzahl, us,
+                        treffer ? "  WECKWORT." : "");
+    return treffer;
 }

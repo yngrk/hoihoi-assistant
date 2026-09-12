@@ -45,6 +45,7 @@ int32_t  s_wort_blk  = 0;        // Laenge des laufenden Worts in Bloecken
 int32_t  s_wort_pk   = 0;        // Spitze darin
 int32_t  s_wort_rms  = 0;        // groesster Blockmittelwert darin
 uint32_t s_woerter   = 0;
+bool     s_geweckt   = false;    // Treffer, noch nicht abgeholt
 
 // --- Merkmale --------------------------------------------------------------
 //
@@ -103,15 +104,15 @@ int32_t rahmen_bei(int64_t abtast)
 // Mittel ueber das Wort abgezogen. Das nimmt heraus, was ueber das ganze Wort
 // gleich bleibt — Mikrofon, Abstand zum Mund, Raum — und uebrig bleibt, wie
 // sich der Klang veraendert. Genau darauf kommt es an.
-void kandidat_pruefen(int32_t von, int32_t bis, int32_t ms)
+bool kandidat_pruefen(int32_t von, int32_t bis, int32_t ms)
 {
-    if (s_ring == nullptr || s_folge == nullptr) return;
+    if (s_ring == nullptr || s_folge == nullptr) return false;
 
     if (von < s_rahmen_nr - kRing + 1) von = s_rahmen_nr - kRing + 1;
     if (von < 0) von = 0;
 
     const int32_t n = bis - von;
-    if (n < 8 || n > vergleich::kMaxRahmen) return;
+    if (n < 8 || n > vergleich::kMaxRahmen) return false;
 
     for (int32_t i = 0; i < n; i++) {
         memcpy(s_folge + (size_t)i * merkmal::kKoeff,
@@ -126,7 +127,7 @@ void kandidat_pruefen(int32_t von, int32_t bis, int32_t ms)
         for (int32_t i = 0; i < n; i++) s_folge[(size_t)i * merkmal::kKoeff + k] -= m;
     }
 
-    vergleich::kandidat(s_folge, n, ms);
+    return vergleich::kandidat(s_folge, n, ms);
 }
 
 void wort_abschliessen(int32_t blockframes)
@@ -142,7 +143,7 @@ void wort_abschliessen(int32_t blockframes)
                             (int)s_wort_rms, (int)s_ruhe);
 
         const int32_t bis = rahmen_bei(s_abtast - (int64_t)kEndeBloecke * blockframes);
-        kandidat_pruefen(s_wort_von, bis, ms);
+        if (kandidat_pruefen(s_wort_von, bis, ms)) s_geweckt = true;
     } else {
         // Verworfen ist hier keine Nebensache: zu lang heisst, zwei Woerter
         // sind zusammengelaufen, zu kurz heisst, eines ist auseinandergefallen.
@@ -267,6 +268,17 @@ void wachwort::feed(const int16_t *pcm, size_t frames, uint32_t rate)
     }
 }
 
+bool wachwort::geweckt()
+{
+    const bool g = s_geweckt;
+    s_geweckt = false;
+    return g;
+}
+
+int32_t wachwort::ruhepegel() { return s_ruhe; }
+int32_t wachwort::schwelle()  { return s_ruhe * kFaktor + kBoden; }
+bool    wachwort::im_wort()   { return s_im_wort; }
+
 void wachwort::ruhe()
 {
     s_im_wort  = false;
@@ -276,6 +288,7 @@ void wachwort::ruhe()
     s_laut     = 0;
     s_still    = 0;
     s_ruhe     = kBoden;
+    s_geweckt  = false;
 
     // Was vor der Pause halb im Puffer stand, gehoert zu keinem Rahmen mehr.
     s_fuell = 0;
