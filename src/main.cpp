@@ -23,6 +23,7 @@
 #include <driver/i2c_master.h>
 #include <esp_adc/adc_oneshot.h>
 #include <esp_timer.h>
+#include <nvs_flash.h>
 #include <math.h>
 
 #include "display_bsp.h"
@@ -30,6 +31,9 @@
 #include "gfx.h"
 #include "audio.h"
 #include "listen.h"
+#include "net.h"
+#include "secrets.h"
+#include "stt.h"
 #include "user_config.h"
 
 static const char *TAG = "bringup";
@@ -43,6 +47,10 @@ static Canvas *display = nullptr;
 // Zuhoeren auf Tastendruck. Geschrieben wird nur im Aufnahmetask, gelesen
 // zusaetzlich im Anzeigetask — siehe listen.h zur Synchronisierung.
 static Listener listener;
+
+// Spracherkennung. Haengt am Listener und arbeitet in einem eigenen Task,
+// der Anzeigetask liest nur Phase und Text.
+static Stt stt;
 
 // Erwartete Teilnehmer am I2C-Bus, fuer eine lesbare Scan-Ausgabe.
 struct KnownDevice {
@@ -359,11 +367,39 @@ static const int kColLeftX     = 8;
 static const int kDividerX     = 200;
 static const int kColRightX    = 210;
 
-// 40 Frames je Spalte bei 16 kHz und 400 Spalten ergeben genau eine Sekunde
+// Waehrend einer Aufnahme belegt dasselbe Band eine andere Einteilung:
+// Aufnahmezeichen und Zeitbalken oben, darunter der Text, der gerade
+// erkannt wird. Kennzahlen treten so lange zurueck — wer spricht, schaut
+// auf den Text und nicht auf die Batteriespannung.
+static const int kDotCX      = kColLeftX + 11;
+static const int kDotCY      = 34;
+static const int kDotR       = 11;
+static const int kBarX0      = kDotCX + kDotR + 10;
+static const int kBarX1      = LCD_WIDTH - kColLeftX - 1;
+static const int kBarY0      = 25;
+static const int kBarY1      = 43;
+static const int kPhaseY     = 54;
+static const int kTextY      = 74;
+static const int kTextScale  = 2;
+static const int kTextStep   = 18;
+static const int kTextLines  = (kStatsBottom - kTextY) / kTextStep;   // 8
+
+// So lange bleibt das Ergebnis nach dem Loslassen stehen, bevor die Anzeige
+// zu den Kennzahlen zurueckkehrt. Kuerzer waere der erkannte Satz weg, bevor
+// er gelesen ist.
+static const int64_t kResultHoldUs = 8 * 1000000;
+
+// 24 kHz, nicht 16: die Realtime-API bekommt den Ton so, wie er aufgenommen
+// wurde, und 24 kHz ist dort die Rate, auf die alles ausgelegt ist.
+// Umrechnen auf dem Geraet waere zusaetzlicher Code an einer Stelle, an der
+// ein Fehler nur als schlechtere Erkennung auffiele.
+static const uint32_t kSampleRate = 24000;
+
+// 60 Frames je Spalte bei 24 kHz und 400 Spalten ergeben genau eine Sekunde
 // Signal ueber die volle Bildbreite.
-static const int kFramesPerColumn = 40;
+static const int kFramesPerColumn = 60;
 static const int kColumnsPerRead  = 8;
-static const int kReadFrames      = kFramesPerColumn * kColumnsPerRead;   // 320 = 20 ms
+static const int kReadFrames      = kFramesPerColumn * kColumnsPerRead;   // 480 = 20 ms
 
 // Geteilter Zustand zwischen Aufnahme- und Anzeigetask.
 static SemaphoreHandle_t scope_lock = nullptr;
@@ -432,34 +468,31 @@ static void draw_field(int x, int y, const char *label, const char *value,
     display->text(x, y + 12, value, ColorBlack, value_scale);
 }
 
+// Kopfzeile invers: der einzige Weg, auf dieser Anzeige etwas hervorzuheben,
+// ohne Flaeche zu verschwenden. Links immer der Name, rechts der Zustand.
+static void draw_header(const char *links, const char *rechts)
+{
+    display->fill_rect(0, kStatsTop, LCD_WIDTH - 1, kHeaderBottom, ColorBlack);
+    display->text(6, kStatsTop + 5, links, ColorWhite, 1);
+    display->text(LCD_WIDTH - 6 - Canvas::text_width(rechts, 1), kStatsTop + 5,
+                  rechts, ColorWhite, 1);
+}
+
 static void draw_stats(int32_t rms)
 {
     char buf[32];
 
-    // Kopfzeile invers: der einzige Weg, auf dieser Anzeige etwas
-    // hervorzuheben, ohne Flaeche zu verschwenden. Beim Zuhoeren kehrt sie
-    // sich noch einmal um — eine Aenderung ueber die volle Breite, die auch
-    // aus zwei Metern Abstand niemand uebersieht.
-    const bool    hoert = listener.listening();
-    const uint8_t grund = hoert ? ColorWhite : ColorBlack;
-    const uint8_t schrift = hoert ? ColorBlack : ColorWhite;
-
-    display->fill_rect(0, kStatsTop, LCD_WIDTH - 1, kHeaderBottom, grund);
-    if (hoert) {
-        // Ohne Rahmen liefe der helle Balken in die weisse Flaeche darunter.
-        display->rect(0, kStatsTop, LCD_WIDTH - 1, kHeaderBottom, ColorBlack);
-    }
-    display->text(6, kStatsTop + 5, "HOIHOI SCREEN ASSISTANT", schrift, 1);
-
-    if (hoert) {
-        const int32_t ms = listener.elapsed_ms();
-        snprintf(buf, sizeof(buf), "HOERT ZU  %d.%d s",
-                 (int)(ms / 1000), (int)((ms / 100) % 10));
+    // Rechts in der Kopfzeile steht, was einem Tastendruck im Weg stehen
+    // koennte. "BEREIT" allein waere eine Behauptung, die ohne WLAN oder
+    // ohne Schluessel nicht stimmt.
+    if (stt.phase() == Stt::Phase::Bereit) {
+        snprintf(buf, sizeof(buf), "BEREIT - KEY HALTEN");
+    } else if (stt.phase() == Stt::Phase::Fehler) {
+        snprintf(buf, sizeof(buf), "ERKENNUNG GESTOERT");
     } else {
-        snprintf(buf, sizeof(buf), "BEREIT");
+        snprintf(buf, sizeof(buf), "%s", net::status());
     }
-    display->text(LCD_WIDTH - 6 - Canvas::text_width(buf, 1), kStatsTop + 5,
-                  buf, schrift, 1);
+    draw_header("HOIHOI SCREEN ASSISTANT", buf);
 
     display->vline(kDividerX, kHeaderBottom + 7, kStatsBottom - 6, ColorBlack);
 
@@ -515,12 +548,109 @@ static void draw_stats(int32_t rms)
     draw_field(kColRightX, 168, "TASTEN", buf, 2);
 }
 
+// Aufnahmeansicht: belegt dasselbe Band wie die Kennzahlen, zeigt aber nur
+// dreierlei — dass aufgenommen wird, wie lange noch Platz ist, und was
+// bisher verstanden wurde.
+static void draw_listening(void)
+{
+    char buf[48];
+    static char text[Stt::kMaxText];   // static: 512 Byte gehoeren nicht auf
+                                       // den Stack des Anzeigetasks
+
+    const bool    hoert = listener.listening();
+    const int32_t ms    = hoert ? listener.elapsed_ms() : listener.last_ms();
+
+    snprintf(buf, sizeof(buf), "%d.%d s / %d s",
+             (int)(ms / 1000), (int)((ms / 100) % 10), Listener::kMaxSeconds);
+    draw_header(hoert ? "AUFNAHME" : "AUFNAHME BEENDET", buf);
+
+    // Aufnahmezeichen: gefuellter Punkt, im Sekundentakt blinkend. Das
+    // Blinken ist der Teil, der auch aus dem Augenwinkel ankommt — ein
+    // stehender Punkt sieht aus wie ein gedrucktes Symbol.
+    if (hoert && ((ms / 400) % 2) == 0) {
+        display->fill_circle(kDotCX, kDotCY, kDotR, ColorBlack);
+    } else {
+        display->circle(kDotCX, kDotCY, kDotR, ColorBlack);
+        display->circle(kDotCX, kDotCY, kDotR - 1, ColorBlack);
+    }
+
+    // Zeitbalken: nicht Schmuck, sondern die Antwort auf die Frage, wie lange
+    // man noch sprechen kann, bevor die Schranke aus listen.h greift.
+    display->rect(kBarX0, kBarY0, kBarX1, kBarY1, ColorBlack);
+
+    const int32_t voll = Listener::kMaxSeconds * 1000;
+    int32_t       anteil = (ms > voll) ? voll : ms;
+    const int     innen  = kBarX1 - kBarX0 - 4;
+    const int     w      = (int)((int64_t)innen * anteil / voll);
+    if (w > 0) {
+        display->fill_rect(kBarX0 + 2, kBarY0 + 2, kBarX0 + 2 + w - 1,
+                           kBarY1 - 2, ColorBlack);
+    }
+    // Sekundenmarken, damit der Balken eine Skala hat und nicht nur eine
+    // Laenge. Sie werden invertiert, wo der Balken schon steht.
+    for (int s = 1; s < Listener::kMaxSeconds; s++) {
+        const int x = kBarX0 + 2 + innen * s / Listener::kMaxSeconds;
+        display->vline(x, kBarY0 + 2, kBarY1 - 2,
+                       (x < kBarX0 + 2 + w) ? ColorWhite : ColorBlack);
+    }
+
+    // Zustand der Erkennung, klein: das ist die Zeile, an der man sieht, ob
+    // ausbleibender Text am Netz liegt oder daran, dass nichts gesagt wurde.
+    snprintf(buf, sizeof(buf), "ERKENNUNG: %s", stt.phase_text());
+    display->text(kColLeftX, kPhaseY, buf, ColorBlack, 1);
+    display->text(LCD_WIDTH - kColLeftX - Canvas::text_width(net::status(), 1),
+                  kPhaseY, net::status(), ColorBlack, 1);
+    display->hline(kColLeftX, LCD_WIDTH - kColLeftX - 1, kPhaseY + 12, ColorBlack);
+
+    stt.copy_text(text, sizeof(text));
+    if (text[0] != '\0') {
+        display->text_wrapped(kColLeftX, kTextY,
+                              LCD_WIDTH - 2 * kColLeftX, text, ColorBlack,
+                              kTextScale, kTextStep, kTextLines);
+    } else {
+        // Ohne Text nicht einfach leer bleiben: eine leere Flaeche sieht aus
+        // wie ein Fehler, auch wenn gerade nur niemand gesprochen hat.
+        const char *hinweis;
+        switch (stt.phase()) {
+            case Stt::Phase::Aus:       hinweis = "OHNE NETZ KEIN TEXT"; break;
+            case Stt::Phase::Verbindet: hinweis = "VERBINDET ..."; break;
+            case Stt::Phase::Fehler:    hinweis = "ERKENNUNG GESTOERT"; break;
+            default:                    hinweis = hoert ? "SPRECHEN ..."
+                                                        : "NICHTS VERSTANDEN"; break;
+        }
+        display->text(kColLeftX, kTextY, hinweis, ColorBlack, kTextScale);
+    }
+}
+
+// Welche Ansicht das obere Band zeigt. Waehrend und kurz nach einer Aufnahme
+// die Aufnahmeansicht, sonst die Kennzahlen.
+static bool aufnahme_ansicht(void)
+{
+    static int64_t bis = 0;
+
+    const bool aktiv = listener.listening()
+                       || stt.phase() == Stt::Phase::Verbindet
+                       || stt.phase() == Stt::Phase::Hoert
+                       || stt.phase() == Stt::Phase::Wartet;
+
+    const int64_t jetzt = esp_timer_get_time();
+    if (aktiv) {
+        bis = jetzt + kResultHoldUs;
+        return true;
+    }
+    return jetzt < bis;
+}
+
 static void draw_scope(const int16_t *lo, const int16_t *hi, int head,
                        int32_t scale, int32_t rms, int32_t peak)
 {
     display->clear(ColorWhite);
 
-    draw_stats(rms);
+    if (aufnahme_ansicht()) {
+        draw_listening();
+    } else {
+        draw_stats(rms);
+    }
 
     // Trennlinien zwischen den drei Baendern.
     display->hline(0, LCD_WIDTH - 1, kStatsBottom + 1, ColorBlack);
@@ -617,7 +747,7 @@ static void visualize_mic(void)
 {
     ESP_LOGI(TAG, "--- Mikrofon-Visualisierung ---");
 
-    if (mic.begin(i2c_bus) != ESP_OK) {
+    if (mic.begin(i2c_bus, kSampleRate) != ESP_OK) {
         ESP_LOGE(TAG, "  Mikrofon nicht verfuegbar, Visualisierung entfaellt.");
         return;
     }
@@ -637,13 +767,29 @@ static void visualize_mic(void)
 
     const esp_err_t lerr = listener.begin(mic.sample_rate());
     if (lerr == ESP_OK) {
-        ESP_LOGI(TAG, "  KEY (GPIO%d) schaltet das Zuhoeren ein und aus, "
-                      "hoechstens %d s am Stueck.",
+        ESP_LOGI(TAG, "  KEY (GPIO%d) gedrueckt halten nimmt auf, loslassen "
+                      "beendet; hoechstens %d s am Stueck.",
                  KEY_BUTTON_PIN, Listener::kMaxSeconds);
     } else {
         ESP_LOGW(TAG, "  Kein Aufnahmepuffer (%s) — KEY schaltet nur den "
                       "Zustand um, ohne Mitschnitt.",
                  esp_err_to_name(lerr));
+    }
+
+    // Spracherkennung. Ohne Schluessel oder ohne WLAN bleibt sie aus, und
+    // alles andere laeuft unveraendert weiter — die Firmware soll auch auf
+    // einem Geraet ohne secrets.h benutzbar bleiben.
+    const esp_err_t serr = stt.begin(&listener, mic.sample_rate(),
+                                     OPENAI_API_KEY, STT_MODEL, STT_LANGUAGE);
+    if (serr == ESP_OK) {
+        ESP_LOGI(TAG, "  Transkription aktiv: %s, Sprache %s.",
+                 STT_MODEL, STT_LANGUAGE);
+    } else if (serr == ESP_ERR_INVALID_ARG) {
+        ESP_LOGW(TAG, "  Kein OPENAI_API_KEY in secrets.h — es wird "
+                      "aufgenommen, aber nicht erkannt.");
+    } else {
+        ESP_LOGE(TAG, "  Transkription nicht gestartet (%s).",
+                 esp_err_to_name(serr));
     }
 
     // Anzeige auf den zweiten Kern, damit das Zeichnen die Aufnahme nicht
@@ -753,6 +899,24 @@ static void visualize_mic(void)
 extern "C" void app_main(void)
 {
     ESP_LOGI(TAG, "===== ESP32-S3-RLCD-4.2 Bring-up =====");
+
+    // NVS zuerst: der WLAN-Treiber legt dort seine Kalibrierdaten ab und
+    // verweigert sonst den Start. Ist die Partition aus einer aelteren
+    // Firmware belegt oder voll, hilft nur loeschen — die Daten darin sind
+    // ohnehin nur Zwischenstand, kein Zustand, den jemand vermisst.
+    esp_err_t nerr = nvs_flash_init();
+    if (nerr == ESP_ERR_NVS_NO_FREE_PAGES || nerr == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        nerr = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(nerr);
+
+    // WLAN frueh und nebenlaeufig: bis der Bring-up durch ist, steht die
+    // Verbindung meist schon.
+    const esp_err_t werr = net::begin(WIFI_SSID, WIFI_PASSWORD);
+    if (werr == ESP_ERR_INVALID_ARG) {
+        ESP_LOGW(TAG, "Kein WIFI_SSID in secrets.h — Geraet bleibt offline.");
+    }
 
     report_chip();
     init_i2c();

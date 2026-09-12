@@ -77,11 +77,26 @@ class Canvas {
     void rect(int x0, int y0, int x1, int y1, uint8_t color);
     void fill_rect(int x0, int y0, int x1, int y1, uint8_t color);
 
+    // Kreis um (cx, cy) mit Radius r. Bei einem Bit je Pixel gibt es keine
+    // Kantenglaettung, unter etwa r = 4 wird daraus sichtbar ein Achteck.
+    void circle(int cx, int cy, int r, uint8_t color);
+    void fill_circle(int cx, int cy, int r, uint8_t color);
+
     // Text aus dem 5x7-Bitmapfont. x/y ist die linke obere Ecke des ersten
     // Zeichens, scale vergroessert ganzzahlig — bei einem Bit je Pixel gibt es
     // keine Zwischenstufen, also auch keinen Grund fuer etwas anderes.
     // Zeichen ausserhalb von 0x20..0x7F werden als '?' gezeichnet.
+    // Der Text darf UTF-8 sein. Unterstuetzt sind ASCII sowie ae, oe, ue und
+    // sz; die grossen Umlaute werden umgeschrieben (Ae, Oe, Ue), alles andere
+    // wird zu '?'. Siehe font5x7.h.
     void text(int x, int y, const char *s, uint8_t color, int scale = 1);
+
+    // Zeichnet mit Wortumbruch in die Breite w, hoechstens max_lines Zeilen
+    // im Abstand line_step. Passt der Text nicht, werden die letzten Zeilen
+    // gezeigt — bei einem laufenden Transkript ist das Ende das Interessante.
+    // Rueckgabe ist die Anzahl gezeichneter Zeilen.
+    int text_wrapped(int x, int y, int w, const char *s, uint8_t color,
+                     int scale, int line_step, int max_lines);
 
     // Breite in Pixeln, die text() belegen wuerde — fuer rechtsbuendige oder
     // zentrierte Ausgabe, ohne die Zeichenbreite an der Aufrufstelle
@@ -91,6 +106,11 @@ class Canvas {
 
   private:
     static void te_isr(void *arg);
+
+    // Zeichnet den Bereich [begin, end); end == nullptr heisst bis zum
+    // Nullbyte. Gemeinsame Grundlage von text() und text_wrapped().
+    void draw_range(int x, int y, const char *begin, const char *end,
+                    uint8_t color, int scale);
 
     SyncDisplay     &d_;
     int              width_;

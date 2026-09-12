@@ -1,12 +1,15 @@
 #pragma once
 
 // ---------------------------------------------------------------------------
-// Zuhoeren auf Tastendruck.
+// Zuhoeren, solange die Taste gedrueckt ist.
 //
-// Die KEY-Taste schaltet um: einmal druecken startet die Aufnahme, noch einmal
-// druecken beendet sie. Kein Halten — wer spricht, soll die Hand frei haben.
-// Damit das Geraet nicht unbemerkt weiterlaeuft, endet die Aufnahme in jedem
-// Fall nach kMaxSeconds.
+// Die KEY-Taste wirkt wie eine Sprechtaste: druecken und halten nimmt auf,
+// loslassen beendet. Damit bestimmt der Sprecher Anfang und Ende selbst, und
+// es kann kein Zustand offen stehen bleiben, den niemand bemerkt hat.
+//
+// Die Zeitschranke kMaxSeconds bleibt trotzdem, denn der Puffer ist endlich.
+// Sie ist ein Netz, kein Bedienelement: greift sie, endet die Aufnahme, und
+// die Taste wird erst nach dem Loslassen wieder scharf.
 //
 // Was aufgenommen wurde, bleibt nach dem Ende im Puffer stehen. Das ist die
 // Stelle, an der spaeter die Worterkennung ansetzt: sie bekommt einen sauber
@@ -14,7 +17,7 @@
 // selbst entscheiden, wann eine Aeusserung beginnt.
 //
 // Bewusst kein Interrupt an der Taste: der Aufnahmetask ruft poll_key() alle
-// 20 ms auf, und ein Abtastabstand von 20 ms ist zugleich die Entprellung.
+// 20 ms auf, wenn ohnehin ein Audioblock vorliegt.
 // ---------------------------------------------------------------------------
 
 #include <stddef.h>
@@ -24,11 +27,13 @@
 
 class Listener {
   public:
-    // Laenger als das hier wird nicht aufgenommen, und so gross ist der Puffer.
+    // Obergrenze einer Aufnahme, und danach ist der Puffer bemessen.
     static const int kMaxSeconds = 10;
 
-    // Kuerzester Abstand zwischen zwei angenommenen Tastendruecken.
-    static const int32_t kDebounceMs = 200;
+    // So viele Abfragen (je 20 ms) muss die Taste offen sein, bevor die
+    // Aufnahme endet. Ein einzelner Prellimpuls beim Halten wuerde sonst
+    // mitten im Wort abschneiden.
+    static const int32_t kReleasePolls = 2;
 
     // Legt den Aufnahmepuffer im PSRAM an. Schlaegt das fehl, bleibt der
     // Zustandswechsel trotzdem benutzbar, nur ohne Mitschnitt.
@@ -54,6 +59,10 @@ class Listener {
     const int16_t *samples() const { return buf_; }
     size_t         sample_count() const { return (size_t)last_frames_; }
 
+    // Stand der laufenden Aufnahme. Damit kann ein Zweiter mitlesen, waehrend
+    // noch aufgenommen wird, ohne den Aufnahmetask zu beruehren.
+    size_t live_count() const { return (size_t)live_frames_; }
+
   private:
     void start();
     void stop(const char *grund);
@@ -73,7 +82,8 @@ class Listener {
     volatile int32_t last_ms_     = 0;
     volatile int32_t last_peak_   = 0;
     volatile int32_t last_frames_ = 0;
+    volatile int32_t live_frames_ = 0;
 
-    bool    key_was_pressed_ = false;
-    int32_t last_edge_ms_    = 0;
+    int32_t released_ = kReleasePolls;   // Aufnahmen starten erst nach einem
+    bool    gesperrt_ = false;           // sauberen Loslassen der Taste
 };

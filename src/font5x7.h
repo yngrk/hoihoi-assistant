@@ -21,3 +21,16 @@ static const int kFontHeight  = 7;
 static const int kFontAdvance = 6;
 
 extern const uint8_t kFont5x7[96 * 5];
+
+// Deutsche Sonderzeichen ausserhalb von ASCII. Die grossen Umlaute fehlen
+// absichtlich: ein Grossbuchstabe belegt alle sieben Zeilen, fuer die Punkte
+// bleibt keine frei. Canvas::text() schreibt sie stattdessen um (Ae, Oe, Ue).
+enum {
+    kGlyphAe = 0,
+    kGlyphOe,
+    kGlyphUe,
+    kGlyphSz,
+    kFontExtraCount
+};
+
+extern const uint8_t kFont5x7Extra[kFontExtraCount * 5];

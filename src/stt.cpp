@@ -1,0 +1,360 @@
+#include "stt.h"
+
+#include <stdio.h>
+#include <string.h>
+
+#include <cJSON.h>
+#include <esp_crt_bundle.h>
+#include <esp_event.h>
+#include <esp_heap_caps.h>
+#include <esp_log.h>
+#include <esp_timer.h>
+#include <esp_websocket_client.h>
+#include <freertos/task.h>
+#include <mbedtls/base64.h>
+
+#include "net.h"
+
+static const char *TAG = "stt";
+
+static const char *kUri = "wss://api.openai.com/v1/realtime?intent=transcription";
+
+// Base64 blaeht auf 4/3 auf; plus Abschluss und etwas Luft fuer die Huelle.
+static const size_t kB64Bytes  = ((2400 * 2 + 2) / 3) * 4 + 8;
+static const size_t kJsonBytes = kB64Bytes + 128;
+
+// Wie lange nach dem Loslassen auf den Endtext gewartet wird, bevor die
+// Verbindung ohnehin geschlossen wird.
+static const int64_t kFinalWaitUs = 8 * 1000000;
+
+esp_err_t Stt::begin(Listener *quelle, uint32_t sample_rate,
+                     const char *key, const char *model, const char *language)
+{
+    quelle_ = quelle;
+    rate_   = sample_rate;
+    key_    = key;
+    model_  = model;
+    lang_   = language;
+
+    text_lock_ = xSemaphoreCreateMutex();
+    if (text_lock_ == nullptr) return ESP_ERR_NO_MEM;
+
+    if (key == nullptr || key[0] == '\0') {
+        phase_ = (int32_t)Phase::Aus;
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    b64_  = (uint8_t *)heap_caps_malloc(kB64Bytes, MALLOC_CAP_SPIRAM);
+    json_ = (char *)heap_caps_malloc(kJsonBytes, MALLOC_CAP_SPIRAM);
+    if (b64_ == nullptr || json_ == nullptr) {
+        phase_ = (int32_t)Phase::Fehler;
+        return ESP_ERR_NO_MEM;
+    }
+
+    phase_ = (int32_t)Phase::Bereit;
+
+    // Eigener Task: weder die Aufnahme noch die Anzeige duerfen auf das Netz
+    // warten. Kern 0, damit der Anzeigetask auf Kern 1 ungestoert bleibt.
+    if (xTaskCreatePinnedToCore(task_trampolin, "stt", 6144, this, 3, nullptr, 0)
+        != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+void Stt::task_trampolin(void *self)
+{
+    ((Stt *)self)->run();
+}
+
+const char *Stt::phase_text() const
+{
+    switch ((Phase)phase_) {
+        case Phase::Aus:       return net::connected() ? "KEIN SCHLUESSEL" : "OFFLINE";
+        case Phase::Bereit:    return "BEREIT";
+        case Phase::Verbindet: return "VERBINDET";
+        case Phase::Hoert:     return "HOERT ZU";
+        case Phase::Wartet:    return "SCHLIESST AB";
+        default:               return "FEHLER";
+    }
+}
+
+void Stt::copy_text(char *out, size_t n) const
+{
+    if (out == nullptr || n == 0) return;
+    out[0] = '\0';
+    if (text_lock_ == nullptr) return;
+
+    if (xSemaphoreTake(text_lock_, pdMS_TO_TICKS(5)) == pdTRUE) {
+        strncpy(out, text_, n - 1);
+        out[n - 1] = '\0';
+        xSemaphoreGive(text_lock_);
+    }
+}
+
+void Stt::set_text(const char *s)
+{
+    xSemaphoreTake(text_lock_, portMAX_DELAY);
+    text_len_ = 0;
+    text_[0]  = '\0';
+    if (s != nullptr) {
+        strncpy(text_, s, kMaxText - 1);
+        text_[kMaxText - 1] = '\0';
+        text_len_           = strlen(text_);
+    }
+    xSemaphoreGive(text_lock_);
+}
+
+void Stt::append_text(const char *s)
+{
+    if (s == nullptr || *s == '\0') return;
+
+    xSemaphoreTake(text_lock_, portMAX_DELAY);
+    const size_t frei = (kMaxText - 1) - text_len_;
+    if (frei > 0) {
+        strncat(text_, s, frei);
+        text_len_ = strlen(text_);
+    }
+    xSemaphoreGive(text_lock_);
+}
+
+// --- WebSocket ------------------------------------------------------------
+
+void Stt::ws_event(void *args, esp_event_base_t, int32_t id, void *event_data)
+{
+    Stt        *self = (Stt *)args;
+    const auto *d    = (const esp_websocket_event_data_t *)event_data;
+
+    switch (id) {
+        case WEBSOCKET_EVENT_CONNECTED:
+            self->verbunden_ = 1;
+            break;
+
+        case WEBSOCKET_EVENT_DISCONNECTED:
+        case WEBSOCKET_EVENT_CLOSED:
+            self->verbunden_  = 0;
+            self->sitzung_ok_ = 0;
+            break;
+
+        case WEBSOCKET_EVENT_ERROR:
+            ESP_LOGW(TAG, "WebSocket-Fehler.");
+            break;
+
+        case WEBSOCKET_EVENT_DATA:
+            // op_code 1 ist Text. Lange Nachrichten kommen in Stuecken; nur
+            // ein vollstaendig angekommenes Stueck laesst sich auswerten.
+            if (d != nullptr && d->op_code == 0x01 && d->data_len > 0
+                && d->payload_offset == 0 && d->data_len == d->payload_len) {
+                self->on_message(d->data_ptr, d->data_len);
+            } else if (d != nullptr && d->op_code == 0x01
+                       && d->payload_len > d->data_len) {
+                // Sollte bei diesen Nachrichten nicht vorkommen; wenn doch,
+                // lieber melden als still einen halben Text auswerten.
+                ESP_LOGW(TAG, "Nachricht zerteilt (%d von %d), verworfen.",
+                         d->data_len, d->payload_len);
+            }
+            break;
+
+        default:
+            break;
+    }
+}
+
+void Stt::on_message(const char *data, int len)
+{
+    cJSON *root = cJSON_ParseWithLength(data, (size_t)len);
+    if (root == nullptr) return;
+
+    const cJSON *type = cJSON_GetObjectItemCaseSensitive(root, "type");
+    if (cJSON_IsString(type) && type->valuestring != nullptr) {
+        const char *t = type->valuestring;
+
+        if (strcmp(t, "conversation.item.input_audio_transcription.delta") == 0) {
+            const cJSON *d = cJSON_GetObjectItemCaseSensitive(root, "delta");
+            if (cJSON_IsString(d)) append_text(d->valuestring);
+
+        } else if (strcmp(t, "conversation.item.input_audio_transcription.completed") == 0) {
+            const cJSON *tr = cJSON_GetObjectItemCaseSensitive(root, "transcript");
+            if (cJSON_IsString(tr)) set_text(tr->valuestring);
+            endtext_ = 1;
+            ESP_LOGI(TAG, "Endtext: %s",
+                     cJSON_IsString(tr) ? tr->valuestring : "(leer)");
+
+        } else if (strcmp(t, "session.updated") == 0
+                   || strcmp(t, "transcription_session.updated") == 0) {
+            sitzung_ok_ = 1;
+            ESP_LOGI(TAG, "Sitzung eingerichtet.");
+
+        } else if (strcmp(t, "error") == 0) {
+            const cJSON *err = cJSON_GetObjectItemCaseSensitive(root, "error");
+            const cJSON *msg = err ? cJSON_GetObjectItemCaseSensitive(err, "message")
+                                   : nullptr;
+            ESP_LOGE(TAG, "Dienstfehler: %s",
+                     cJSON_IsString(msg) ? msg->valuestring : "(ohne Text)");
+            phase_ = (int32_t)Phase::Fehler;
+        }
+    }
+
+    cJSON_Delete(root);
+}
+
+bool Stt::send_json(const char *json)
+{
+    if (client_ == nullptr) return false;
+    const int len = (int)strlen(json);
+    const int ret = esp_websocket_client_send_text(
+        (esp_websocket_client_handle_t)client_, json, len, pdMS_TO_TICKS(2000));
+    return ret == len;
+}
+
+bool Stt::send_config()
+{
+    // turn_detection bleibt aus: Anfang und Ende bestimmt die Taste, nicht
+    // eine Stimmerkennung auf der Gegenseite.
+    snprintf(json_, kJsonBytes,
+             "{\"type\":\"session.update\",\"session\":{"
+             "\"type\":\"transcription\",\"audio\":{\"input\":{"
+             "\"format\":{\"type\":\"audio/pcm\",\"rate\":%u},"
+             "\"transcription\":{\"model\":\"%s\",\"language\":\"%s\"},"
+             "\"turn_detection\":null}}}}",
+             (unsigned)rate_, model_, lang_);
+    return send_json(json_);
+}
+
+bool Stt::send_audio(const int16_t *pcm, size_t frames)
+{
+    size_t olen = 0;
+    if (mbedtls_base64_encode(b64_, kB64Bytes, &olen,
+                              (const unsigned char *)pcm, frames * 2) != 0) {
+        return false;
+    }
+    b64_[olen] = '\0';
+
+    const int n = snprintf(json_, kJsonBytes,
+                           "{\"type\":\"input_audio_buffer.append\",\"audio\":\"%s\"}",
+                           (const char *)b64_);
+    if (n <= 0 || (size_t)n >= kJsonBytes) return false;
+    return send_json(json_);
+}
+
+esp_err_t Stt::open_session()
+{
+    char header[256];
+    snprintf(header, sizeof(header),
+             "Authorization: Bearer %s\r\nOpenAI-Beta: realtime=v1\r\n", key_);
+
+    esp_websocket_client_config_t cfg = {};
+    cfg.uri                     = kUri;
+    cfg.headers                 = header;
+    cfg.crt_bundle_attach       = esp_crt_bundle_attach;
+    cfg.buffer_size             = 4096;
+    cfg.task_stack              = 6144;
+    cfg.disable_auto_reconnect  = true;
+    cfg.network_timeout_ms      = 10000;
+    cfg.reconnect_timeout_ms    = 5000;
+
+    client_ = esp_websocket_client_init(&cfg);
+    if (client_ == nullptr) return ESP_FAIL;
+
+    esp_websocket_register_events((esp_websocket_client_handle_t)client_,
+                                  WEBSOCKET_EVENT_ANY, ws_event, this);
+
+    verbunden_  = 0;
+    sitzung_ok_ = 0;
+    endtext_    = 0;
+
+    return esp_websocket_client_start((esp_websocket_client_handle_t)client_);
+}
+
+void Stt::close_session(const char *grund)
+{
+    if (client_ == nullptr) return;
+
+    ESP_LOGI(TAG, "Sitzung beendet (%s).", grund);
+    esp_websocket_client_close((esp_websocket_client_handle_t)client_,
+                               pdMS_TO_TICKS(1000));
+    esp_websocket_client_destroy((esp_websocket_client_handle_t)client_);
+    client_     = nullptr;
+    verbunden_  = 0;
+    sitzung_ok_ = 0;
+}
+
+// --- Ablauf ---------------------------------------------------------------
+
+void Stt::run()
+{
+    bool    war_aktiv = false;
+    bool    konfiguriert = false;
+    int64_t warte_seit = 0;
+
+    while (true) {
+        const bool aktiv = quelle_->listening();
+
+        // --- Tastendruck: Verbindung aufbauen ---
+        if (aktiv && !war_aktiv) {
+            gesendet_    = 0;
+            konfiguriert = false;
+            set_text("");
+
+            if (!net::connected()) {
+                phase_ = (int32_t)Phase::Aus;
+            } else if (open_session() == ESP_OK) {
+                phase_ = (int32_t)Phase::Verbindet;
+            } else {
+                phase_ = (int32_t)Phase::Fehler;
+            }
+        }
+
+        // --- Sitzung einrichten, sobald die Verbindung steht ---
+        if (client_ != nullptr && verbunden_ && !konfiguriert) {
+            konfiguriert = send_config();
+        }
+
+        // --- Ton nachschicken ---
+        // Waehrend des Verbindungsaufbaus laeuft die Aufnahme schon. Der
+        // Listener haelt alles im PSRAM, also geht nichts verloren: sobald
+        // die Sitzung steht, wird der Rueckstand aufgeholt.
+        if (client_ != nullptr && sitzung_ok_) {
+            if (phase_ == (int32_t)Phase::Verbindet) phase_ = (int32_t)Phase::Hoert;
+
+            const int16_t *pcm  = quelle_->samples();
+            const size_t   have = aktiv ? quelle_->live_count()
+                                        : quelle_->sample_count();
+
+            while (pcm != nullptr && gesendet_ < have) {
+                size_t n = have - gesendet_;
+                if (n > kChunkFrames) n = kChunkFrames;
+                // Solange noch aufgenommen wird, nur volle Stuecke schicken —
+                // das haelt die Zahl der Nachrichten klein.
+                if (aktiv && n < kChunkFrames) break;
+
+                if (!send_audio(&pcm[gesendet_], n)) break;
+                gesendet_ += n;
+            }
+        }
+
+        // --- Taste los: abschliessen ---
+        if (!aktiv && war_aktiv) {
+            if (client_ != nullptr && sitzung_ok_) {
+                send_json("{\"type\":\"input_audio_buffer.commit\"}");
+                phase_     = (int32_t)Phase::Wartet;
+                warte_seit = esp_timer_get_time();
+            } else {
+                close_session("ohne Sitzung");
+                phase_ = (int32_t)Phase::Bereit;
+            }
+        }
+
+        // --- Endtext abwarten ---
+        if (phase_ == (int32_t)Phase::Wartet) {
+            const bool zu_lang = (esp_timer_get_time() - warte_seit) > kFinalWaitUs;
+            if (endtext_ || zu_lang || !verbunden_) {
+                close_session(endtext_ ? "fertig" : "Zeit abgelaufen");
+                phase_ = (int32_t)Phase::Bereit;
+            }
+        }
+
+        war_aktiv = aktiv;
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}

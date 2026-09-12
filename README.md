@@ -80,10 +80,13 @@ src/main.cpp              Bring-up-Ablauf
 src/user_config.h         Pinbelegung
 src/gfx.h, src/gfx.cpp    Clippende Zeichenschicht über dem Treiber
 src/display_sync.h, .cpp  DisplayPort mit Rückmeldung über das DMA-Ende
-src/font5x7.h, .cpp       5×7-Bitmapfont, ASCII 0x20–0x7F
+src/font5x7.h, .cpp       5×7-Bitmapfont, ASCII 0x20–0x7F plus ä ö ü ß
 src/audio.h, src/audio.cpp  Mikrofoneingang: ES7210 über I²C, Daten über I²S
 src/listen.h, .cpp        Zuhören auf Tastendruck, Mitschnitt im PSRAM
-src/idf_component.yml     Abhängigkeit auf espressif/esp_codec_dev
+src/net.h, .cpp           WLAN im Stationsbetrieb
+src/stt.h, .cpp           Sprache zu Text über die Realtime-API von OpenAI
+src/secrets.h.example     Vorlage für WLAN-Zugang und API-Schlüssel
+src/idf_component.yml     esp_codec_dev und esp_websocket_client
 components/port_bsp/      ST7305-Treiber von Waveshare, eine Zeile geändert
 sdkconfig.defaults        Flash-, PSRAM- und Konsolenkonfiguration
 partitions.csv            8 MB App-Partition
@@ -134,7 +137,7 @@ Figma-Entwurf mit den Anteilen 76 / 19 / 4 Prozent bei 4:3:
 
 | Band | Zeilen | Inhalt |
 |---|---|---|
-| stats | 0–227 | Kopfzeile, Umweltwerte links, Systemzustand rechts |
+| stats | 0–227 | Kopfzeile, Umweltwerte links, Systemzustand rechts — während einer Aufnahme stattdessen Aufnahmezustand und Transkript |
 | audio wave visualizer | 230–286 | Wellenbild, eine Sekunde Signal |
 | audio scale | 290–299 | Pegelbalken in dBFS |
 
@@ -167,9 +170,14 @@ Slave — MCLK muss deshalb bespielt werden, sonst arbeitet der Wandler ohne
 Referenz. Die Registerprogrammierung übernimmt Espressifs `esp_codec_dev`; das
 ist deutlich verlässlicher, als die Werte selbst herzuleiten.
 
-16 kHz, 16 Bit, beide Kanäle zu Mono gemittelt. 40 Frames je Bildspalte mal 400
+24 kHz, 16 Bit, beide Kanäle zu Mono gemittelt. 60 Frames je Bildspalte mal 400
 Spalten ergeben genau eine Sekunde Signal über die volle Breite; das Bild läuft
 nach links weg.
+
+24 kHz und nicht 16, seit die Transkription dazugekommen ist: die Realtime-API
+ist auf 24 kHz ausgelegt, und so geht der Ton unverändert hinaus. Umrechnen auf
+dem Gerät wäre zusätzlicher Code an einer Stelle, an der ein Fehler nur als
+schlechtere Erkennung auffiele.
 
 Aufnahme und Anzeige laufen in **getrennten Tasks**, und das ist keine
 Stilfrage. Das Panel gibt über die TE-Leitung 27,03 Hz vor (gemessen: 36990 µs,
@@ -215,25 +223,91 @@ die Austastlücke.
 
 ## Zuhören auf Tastendruck
 
-Die KEY-Taste (GPIO18) schaltet um: einmal drücken startet das Zuhören, noch
-einmal drücken beendet es. Kein Halten — wer spricht, soll die Hand frei haben.
-Spätestens nach zehn Sekunden endet die Aufnahme von selbst, damit das Gerät
-nicht unbemerkt weiterläuft.
+Die KEY-Taste (GPIO18) ist eine Sprechtaste: drücken und **halten** nimmt auf,
+loslassen beendet. Damit bestimmt der Sprecher Anfang und Ende selbst, und es
+kann kein Zustand offen stehen bleiben, den niemand bemerkt hat — der Fall, den
+ein Umschalter zwangsläufig mitbringt.
 
-Sichtbar wird der Zustand über die Kopfzeile: sie kehrt sich beim Zuhören um,
-schwarz auf weiß statt weiß auf schwarz, und zeigt rechts die laufende Zeit. Auf
-einem reflektiven Schwarzweißdisplay ist eine Umkehrung über die volle Breite
-das deutlichste verfügbare Signal — Farbe, Helligkeit und Blinken fallen aus.
-Nach dem Ende steht Dauer und Spitzenpegel der letzten Aufnahme unter dem Pegel.
+Die Zehn-Sekunden-Schranke bleibt trotzdem, denn der Puffer ist endlich. Sie
+ist ein Netz, kein Bedienelement: greift sie, endet die Aufnahme, und die Taste
+wird erst nach dem Loslassen wieder scharf. Der Puffer fasst elf Sekunden, also
+eine mehr als die Schranke — bei genau zehn liefe er voll, bevor die Uhr
+abgelaufen ist, und jede Aufnahme endete mit der falschen Begründung.
 
-Der Mitschnitt liegt im PSRAM (elf Sekunden bei 16 kHz, rund 350 KB) und bleibt
-nach dem Ende stehen. Das ist die Stelle, an der die Worterkennung ansetzen
-wird: sie bekommt einen sauber abgegrenzten Abschnitt statt eines endlosen
-Stroms und muss nicht selbst entscheiden, wann eine Äußerung beginnt.
+Der Mitschnitt liegt im PSRAM (elf Sekunden bei 24 kHz, rund 528 KB) und bleibt
+nach dem Ende stehen. Daran hängt die Transkription: sie bekommt einen sauber
+abgegrenzten Abschnitt statt eines endlosen Stroms, und weil alles im Puffer
+steht, geht auch nichts verloren, während die Verbindung noch aufgebaut wird.
 
 Die Taste hängt an keinem Interrupt. Der Aufnahmetask fragt sie alle 20 ms ab,
 wenn ohnehin ein Audioblock vorliegt, und dieser Abtastabstand ist zugleich die
-Entprellung.
+Entprellung. Zwei Abfragen ohne Kontakt gelten als Loslassen — ein einzelner
+Prellimpuls während des Haltens schnitte sonst mitten im Wort ab.
+
+## Sprache zu Text
+
+Freie Transkription auf dem Gerät selbst gibt es nicht: Whisper tiny sind rund
+39 MB in int8, der Chip hat 8 MB PSRAM, und Espressifs esp-sr kann hier nur
+feste Kommandolisten. Wer freien Text will, braucht einen Dienst — und wer ihn
+*während* des Sprechens sehen will, einen, der Teilergebnisse schickt.
+
+Deshalb die **Realtime-API** von OpenAI und nicht `/v1/audio/transcriptions`:
+letztere nimmt die fertige Datei und antwortet einmal, hier kommt der Text
+stückweise zurück, während noch gesprochen wird. Modell ist
+`gpt-4o-mini-transcribe` — mit 0,003 $/min zugleich das günstigste und das
+einzige, das Teiltexte liefert; `whisper-1` kostet das Doppelte und kann es
+nicht. Fünf Sekunden Sprechen kosten damit rund 0,00025 $.
+
+```
+wss://api.openai.com/v1/realtime?intent=transcription
+  Authorization: Bearer <key>,  OpenAI-Beta: realtime=v1
+  -> session.update             Format, Modell, Sprache, turn_detection: null
+  -> input_audio_buffer.append  Base64-PCM16
+  -> input_audio_buffer.commit  beim Loslassen der Taste
+  <- ...input_audio_transcription.delta      Teiltext
+  <- ...input_audio_transcription.completed  Endtext
+```
+
+`turn_detection` bleibt aus: Anfang und Ende bestimmt die Taste, nicht eine
+Stimmerkennung auf der Gegenseite.
+
+[src/stt.h](src/stt.h) hängt sich an den `Listener` und macht den Rest allein —
+Tastendruck bemerken, Verbindung aufbauen, nachschicken, was während des
+Verbindungsaufbaus schon aufgenommen wurde, und nach dem Endtext wieder
+schließen. Das läuft in einem eigenen Task auf Kern 0, damit weder Aufnahme noch
+Anzeige auf das Netz warten. Der TLS-Handschlag dauert ein bis zwei Sekunden;
+weil der Mitschnitt vollständig im PSRAM steht, kostet das trotzdem keine Silbe:
+ein Sendezeiger holt den Rückstand auf, sobald die Sitzung steht.
+
+### Zugangsdaten
+
+`src/secrets.h` ist bewusst **nicht** im Repository. Vorlage kopieren und
+ausfüllen:
+
+```bash
+cp src/secrets.h.example src/secrets.h
+```
+
+Ohne `WIFI_SSID` bleibt das Gerät offline, ohne `OPENAI_API_KEY` wird
+aufgenommen, aber nicht erkannt — die übrige Firmware läuft in beiden Fällen
+unverändert weiter, und der Bring-up sagt im Log, was fehlt.
+
+### Anzeige während der Aufnahme
+
+Das obere Band wechselt für die Dauer der Aufnahme die Einteilung: statt der
+Kennzahlen stehen dort ein blinkender Aufnahmepunkt, ein Zeitbalken mit
+Sekundenmarken bis zur Zehn-Sekunden-Schranke, eine Zeile über den Zustand der
+Erkennung und darunter der Text, so wie er hereinkommt. Wer spricht, schaut auf
+den Text und nicht auf die Batteriespannung.
+
+Der Text wird mit Wortumbruch gesetzt und zeigt bei Überlänge die **letzten**
+acht Zeilen — bei einem laufenden Transkript ist das Ende das Interessante.
+Acht Sekunden nach dem Abschluss kehrt die Anzeige zu den Kennzahlen zurück;
+kürzer wäre das Ergebnis weg, bevor es gelesen ist.
+
+Der Font kennt dafür vier zusätzliche Zeichen: ä, ö, ü und ß. Die großen
+Umlaute passen nicht in sieben Zeilen und werden zu Ae, Oe, Ue umgeschrieben,
+alles andere außerhalb von ASCII wird ein Fragezeichen.
 
 ## Offene Punkte
 

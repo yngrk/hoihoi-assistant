@@ -9,3 +9,6 @@ build/
 # reproduzierbar. dependencies.lock wird dagegen versioniert, damit der Build
 # auf allen Rechnern dieselben Versionen zieht.
 managed_components/
+
+# WLAN-Zugangsdaten und API-Schluessel. Muster in src/secrets.h.example.
+src/secrets.h
