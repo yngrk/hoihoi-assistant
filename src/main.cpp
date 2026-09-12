@@ -34,6 +34,7 @@
 #include "listen.h"
 #include "logview.h"
 #include "nachtrag.h"
+#include "vergleich.h"
 #include "wachwort.h"
 #include "cfg.h"
 #include "net.h"
@@ -869,14 +870,30 @@ static void draw_answer(void)
 // BOOT schaltet zwischen Log und Kennzahlen um. Die Taste haengt an keinem
 // Interrupt, sondern wird einmal je Bild abgefragt — 37 ms Abstand sind
 // zugleich die Entprellung, dieselbe Ueberlegung wie bei der KEY-Taste.
-// Ausgewertet wird die fallende Flanke: sonst liefe die Ansicht durch,
-// solange jemand die Taste haelt.
+//
+// Lang gehalten lernt sie stattdessen das Weckwort ein. Deshalb schaltet die
+// Ansicht jetzt beim Loslassen um und nicht mehr beim Druecken: solange die
+// Taste unten ist, steht noch nicht fest, was gemeint war.
 static void poll_view_button(void)
 {
-    static int vorher = 1;
+    static int     vorher = 1;
+    static int64_t seit   = 0;
+    static bool    lang   = false;
 
     const int jetzt = gpio_get_level(BOOT_BUTTON_PIN);
-    if (vorher != 0 && jetzt == 0) log_ansicht = !log_ansicht;
+
+    if (vorher != 0 && jetzt == 0) {
+        seit = esp_timer_get_time();
+        lang = false;
+    }
+
+    if (jetzt == 0 && !lang && esp_timer_get_time() - seit > 1500000) {
+        lang = true;
+        vergleich::einlernen();
+    }
+
+    if (vorher == 0 && jetzt != 0 && !lang) log_ansicht = !log_ansicht;
+
     vorher = jetzt;
 }
 
@@ -1193,6 +1210,15 @@ static bool visualize_mic(void)
     } else {
         ESP_LOGE(TAG, "  Sprachausgabe nicht gestartet (%s).",
                  esp_err_to_name(terr));
+    }
+
+    // Das Weckwort braucht seine Tabellen, bevor der erste Block hereinkommt:
+    // im Aufnahmetask darf nichts mehr belegt werden.
+    const esp_err_t werr = wachwort::bereit();
+    if (werr == ESP_OK) {
+        ESP_LOGI(TAG, "  Weckwort hoert mit.");
+    } else {
+        ESP_LOGW(TAG, "  Weckwort aus (%s).", esp_err_to_name(werr));
     }
 
     // Der Aufnahmetakt bekommt einen eigenen Task, auf dem zweiten Kern und

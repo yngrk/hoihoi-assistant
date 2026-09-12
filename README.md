@@ -746,8 +746,107 @@ Kandidaten je Minute, davon aber nur fünf im Längenfenster von 300 bis 700 ms.
 Die Längenschranke allein wirft also drei Viertel weg, bevor gerechnet wird —
 der Vergleich muss rund 360 fremde Wörter je Stunde ablehnen, nicht Tausende.
 
-Offen sind damit noch die Merkmale (MFCC), das Einlernen und der Vergleich
-selbst.
+### Merkmale statt Rohton
+
+Zwei Aufnahmen desselben Wortes sind als Abtastwerte völlig verschieden — eine
+Verschiebung um eine halbe Schwingung dreht jedes Vorzeichen um, ohne dass sich
+für das Ohr etwas ändert. Verglichen wird deshalb nicht der Ton, sondern wie
+sich sein Klang über die Zeit verändert: Spektrum über 21 ms, Zusammenfassen in
+26 Mel-Bänder zwischen 100 und 8000 Hz, Logarithmus, Kosinustransformation.
+Zwölf Zahlen je Rahmen, alle 10,7 ms einer. Der nullte Koeffizient fällt weg —
+der ist nur die Gesamtlautstärke und sähe bei leisem und lautem „HoiHoi"
+verschieden aus, obwohl es dasselbe Wort ist.
+
+Gerechnet wird durchgehend und nicht erst, wenn ein Wort fertig ist: **327 µs je
+Rahmen, 94 je Sekunde, 3,0 % Rechenzeit.** Gleichmäßig wenig ist hier besser als
+selten viel — der Aufnahmetask darf nirgends 60 ms stehen, sonst läuft der
+DMA-Ring über, und eine Spitze am Wortende käme genau dann, wenn ohnehin am
+meisten los ist.
+
+### Ein Feld an der falschen Adresse
+
+Das erste Mal, dass es lief, ergab es für *jeden* Kandidaten „Länge passt zu
+keiner Vorlage" — auch bei 440 ms gegen 420 ms. Eine unmögliche Meldung ist ein
+Hinweis auf die Meldung, nicht auf die Länge: der Abstand kam als NaN heraus,
+und NaN ist bei jedem Kleiner-als falsch, also blieb die beste Vorlage leer.
+
+Die Spur ging rückwärts. Ein Selbsttest beim Start zeigte, dass schon die zwölf
+Koeffizienten NaN waren. Eine Probe durch die FFT zeigte ein sauberes Spektrum
+ohne einen einzigen ungültigen Wert. Eine Ausgabe aller 26 Mel-Bänder zeigte,
+dass genau die letzten beiden kaputt waren — mit *richtiger Länge, aber
+unsinnigem Startindex*. Ein Wert, der erst stimmt und später nicht mehr, wird
+überschrieben; die Adressen sagten wo:
+
+```
+Lage: arbeit 0x3fcb1664..0x3fcb1e64, von 0x3fcb1630
+Vor der Probe: von[22..25] = 105 116 128 141
+Band 24: von -32768, len 27, log NaN
+```
+
+Das Arbeitsfeld der FFT lag unmittelbar hinter der Filterbank, und die letzten
+vier Byte davor wurden beschrieben. Wächter vor und hinter dem Feld benannten
+den Schuldigen: `dsps_fft2r_fc32`. esp-dsp wählt dafür auf dem S3
+`dsps_fft2r_fc32_aes3`, die Fassung mit den 128-Bit-Vektorbefehlen, und die
+verlangt das Feld an einer 16-Byte-Grenze. Unseres lag vier Byte daneben.
+`__attribute__((aligned(16)))` behebt es.
+
+Der Selbsttest ist geblieben. Er rechnet beim Start zwei künstliche Folgen durch
+und meldet den Abstand einer Folge zu sich selbst — muss 0 sein — und zu einer
+anderen. Diesen Fehler hätte er beim ersten Start gezeigt statt drei Schichten
+später als Meldung über Wortlängen.
+
+### Der Vergleich
+
+Zwei Aufnahmen desselben Wortes sind nie gleich lang, und sie sind auch nicht
+gleichmäßig gedehnt — die Vokale ziehen sich, die Konsonanten nicht. Rahmen
+gegen Rahmen zu legen geht deshalb schief, sobald jemand das Wort einmal etwas
+langsamer sagt. Dynamic Time Warping sucht stattdessen den günstigsten Weg durch
+die Tafel aller Rahmenpaare: jeder Rahmen der Vorlage darf auf einen oder
+mehrere des Kandidaten fallen, solange die Reihenfolge stimmt. Heraus kommt ein
+Abstand je Rahmen, vergleichbar auch zwischen verschieden langen Wörtern.
+
+Zwei Beigaben wiegen dabei schwerer als das Verfahren selbst. Der Kandidat wird
+**mittelwertbefreit**: von jedem Koeffizienten wird sein Mittel über das Wort
+abgezogen. Das nimmt heraus, was über das ganze Wort gleich bleibt — Mikrofon,
+Abstand zum Mund, Raum — und übrig bleibt, wie sich der Klang verändert. Und
+Vorlagen, deren Länge um mehr als die Hälfte danebenliegt, werden gar nicht erst
+geprüft; sonst dehnt DTW ein kurzes Geräusch auf ein langes Wort und kommt dabei
+billig weg.
+
+Eingelernt wird nach langem Druck auf BOOT: die nächsten vier Wörter sind das
+Weckwort. Ohne diesen Anstoß wäre das erste Stuhlrücken nach dem Einschalten
+eine Vorlage geworden — genau das passierte im ersten Probelauf. Kurz gedrückt
+schaltet BOOT weiter die Ansicht um, nur jetzt beim Loslassen: solange die Taste
+unten ist, steht noch nicht fest, was gemeint war.
+
+### Wie weit „HoiHoi" von allem anderen entfernt ist
+
+Vier Vorlagen eingesprochen (400/420/420/420 ms), dann zehnmal dasselbe Wort und
+danach eine halbe Minute normales Reden:
+
+| | Abstände |
+|---|---|
+| zehnmal „HoiHoi" | 5,94 6,66 7,05 7,33 7,43 7,61 7,66 7,77 7,82 **8,02** |
+| fremde Wörter | **10,92** 12,92 13,65 |
+
+Dazwischen liegt eine Lücke ohne einen einzigen Wert. Eine Schwelle bei 9,5
+nimmt alle zehn an und weist alle drei ab.
+
+Drei Einschränkungen gehören dazu. Die drei fremden Wörter sind eine dünne
+Stichprobe — aus einer halben Minute Reden kamen nur drei Kandidaten überhaupt
+bis zum Vergleich, der Rest fiel vorher durch die Längenschranke. Eine Aussage
+über Fehlauslösungen je Stunde lässt sich daraus nicht machen. Der Abstand
+zwischen 8,02 und 10,92 ist etwa ein Drittel, sauber, aber nicht üppig. Und
+alles ist dieselbe Stimme, derselbe Raum, derselbe Abstand zum Mikrofon.
+
+Der Vergleich gegen vier Vorlagen kostet 7 bis 12 ms, gemessen im Aufnahmetask.
+Das passt in die 60 ms des DMA-Rings — es gab keinen einzigen Stau, und das Bild
+lief durchgehend mit 27 bis 28 Bildern je Sekunde —, aber es wächst mit der Zahl
+der Vorlagen. Bei acht wäre es die Hälfte des Puffers.
+
+Offen sind damit noch die Schwelle samt dem eigentlichen Wecken, das dauerhafte
+Ablegen der Vorlagen im NVS und eine Messung der Fehlauslösungen über eine
+Stunde statt über eine halbe Minute.
 
 ## Log auf dem Display
 

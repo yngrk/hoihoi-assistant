@@ -27,7 +27,13 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <esp_err.h>
+
 namespace wachwort {
+
+// Einmal vor dem ersten feed(). Legt die Tabellen fuer MFCC an und den Ring,
+// in dem die Merkmale der letzten Sekunden stehen.
+esp_err_t bereit();
 
 // PCM aus dem Aufnahmetask, blockweise. Darf nicht loggen — siehe nachtrag.h.
 void feed(const int16_t *pcm, size_t frames, uint32_t rate);
