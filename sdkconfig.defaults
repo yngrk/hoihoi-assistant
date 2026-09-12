@@ -37,3 +37,13 @@ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240
 CONFIG_BT_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLED=y
 CONFIG_BT_BLUEDROID_ENABLED=n
+
+# --- mbedTLS: Sende- und Empfangspuffer nur waehrend der Uebertragung ---
+# Eine TLS-Sitzung legt sonst dauerhaft 16 KB Empfangs- und 4 KB Sendepuffer
+# im *internen* Speicher an, auch wenn nichts laeuft. Drei Sitzungen
+# gleichzeitig — die Erkennung ueber WebSocket, die Antwort und die Stimme —
+# waren damit 60 KB, und der Bildpuffer bekam bei jedem Bild seine 15 KB
+# nicht mehr: "Failed to allocate priv TX buffer", ESP_ERROR_CHECK, Neustart.
+# Mit dieser Zeile hoelt mbedTLS die Puffer beim Senden und Empfangen und
+# gibt sie danach wieder her.
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y

@@ -1,6 +1,10 @@
 #include "display_sync.h"
 
+#include <string.h>
+
 #include <esp_attr.h>
+#include <esp_heap_caps.h>
+#include <esp_log.h>
 
 bool IRAM_ATTR SyncDisplay::on_trans_done(esp_lcd_panel_io_handle_t,
                                           esp_lcd_panel_io_event_data_t *,
@@ -55,4 +59,21 @@ void SyncDisplay::send_and_wait()
     if (xSemaphoreTake(dma_sem_, pdMS_TO_TICKS(100)) != pdTRUE) {
         dma_timeouts_++;
     }
+}
+
+esp_err_t SyncDisplay::pin_buffer_to_dma()
+{
+    if (DispBuffer == nullptr || DisplayLen <= 0) return ESP_ERR_INVALID_STATE;
+    if (esp_ptr_dma_capable(DispBuffer)) return ESP_OK;
+
+    uint8_t *neu = (uint8_t *)heap_caps_malloc((size_t)DisplayLen,
+                                               MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    if (neu == nullptr) return ESP_ERR_NO_MEM;
+
+    memcpy(neu, DispBuffer, (size_t)DisplayLen);
+    heap_caps_free(DispBuffer);
+    DispBuffer = neu;
+
+    ESP_LOGI("display", "Bildpuffer im internen Speicher (%d Byte).", DisplayLen);
+    return ESP_OK;
 }

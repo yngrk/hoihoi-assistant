@@ -36,6 +36,19 @@
 // Lautsprecher. Gespielt wird erst, wenn kVorlaufMs darin stehen. Diese
 // Vorlaufzeit ist der ganze Handel — sie verzoegert den ersten Ton um genau
 // so viel und kauft dafuer denselben Betrag an Stockungstoleranz.
+//
+// ---------------------------------------------------------------------------
+// Satzweise, nicht am Stueck
+//
+// Frueher wurde gewartet, bis die Antwort vollstaendig dastand. Das kostete
+// rund anderthalb Sekunden, in denen der erste Satz laengst fertig war.
+// Jetzt wird geholt, was an ganzen Saetzen feststeht, und der Rest waechst
+// waehrend des Sprechens nach — in denselben Ring, ohne Naht dazwischen.
+//
+// Die zweite Portion wird geholt, waehrend die erste noch laeuft. Geht das
+// einmal nicht schnell genug, stockt es mitten in der Antwort; deshalb
+// zaehlt der Spieler seine Stockungen und schreibt sie ins Log. Ohne diese
+// Zahl waere jede Aenderung am Vorlauf geraten.
 // ---------------------------------------------------------------------------
 
 #include <stddef.h>
@@ -46,6 +59,7 @@
 #include "audio.h"
 #include "chat.h"
 #include "listen.h"
+#include "verbindung.h"
 
 class Tts {
   public:
@@ -69,13 +83,23 @@ class Tts {
     int32_t first_ms() const { return first_ms_; }
     int32_t spoken_ms() const { return spoken_ms_; }
 
+    // Wer die Sprechtaste drueckt, will sprechen und nicht zuhoeren. Die
+    // laufende Ausgabe faellt dann weg — und zwar *bevor* das Mikrofon den
+    // I2S-Port anfasst, denn beide haengen an derselben Datenschnittstelle.
+    void abbrechen() { if (auftrag_) abbruch_ = 1; }
+
+    // True, solange der Lautsprecher noch beschaeftigt ist. Der Aufnahmetask
+    // wartet darauf, bevor er das Mikrofon oeffnet.
+    bool spricht() const { return auftrag_ != 0; }
+
   private:
     static void hol_trampolin(void *self);
     static void spiel_trampolin(void *self);
 
-    void holen();      // Task 1: Netz in den Ring
-    void spielen();    // Task 2: Ring in den Lautsprecher
-    void sprechen(const char *text);
+    void   holen();          // Task 1: Netz in den Ring
+    void   spielen();        // Task 2: Ring in den Lautsprecher
+    void   runde_spielen();  // eine Antwort, in Portionen
+    size_t stueck_holen(const char *text);   // eine Portion, gelieferte Frames
 
     void   ring_schreiben(const int16_t *pcm, size_t frames);
     size_t ring_belegt() const { return (size_t)(kopf_ - schwanz_); }
@@ -97,7 +121,11 @@ class Tts {
     // nicht dort, wo das erste Byte ankommt.
     volatile int64_t start_us_ = 0;
 
-    uint32_t gesehen_ = 0;   // zuletzt gesprochene Chat::antwort_seq()
+    uint32_t gesehen_ = 0;   // zuletzt gesprochene Chat::runde_seq()
+
+    // Vorwaerm-Adresse und die stehende Verbindung, siehe verbindung.h.
+    char       waerm_[128] = {0};
+    Verbindung weg_;
 
     static const uint32_t kRate = 24000;
 
@@ -107,8 +135,11 @@ class Tts {
     // der volle Ring den Lesevorgang aus, was genau richtig ist.
     static const uint32_t kRingFrames = kRate * 8;
 
-    // Zwei Sekunden Vorlauf. Das ist die Stockung, die folgenlos bleibt.
-    static const uint32_t kVorlaufFrames = kRate * 2;
+    // Vorlauf, und damit die Stockung, die folgenlos bleibt. Zwei Sekunden
+    // waren die sichere Wahl, als der Knacks gerade weg war; sie standen
+    // aber auch mit zwei Sekunden auf dem Weg zum ersten Ton. Jetzt 1,2 —
+    // und der Spieler zaehlt mit, ob es reicht.
+    static const uint32_t kVorlaufFrames = kRate * 6 / 5;
 
     int16_t *ring_ = nullptr;
 
@@ -119,9 +150,10 @@ class Tts {
     volatile uint32_t kopf_    = 0;
     volatile uint32_t schwanz_ = 0;
 
-    volatile int32_t auftrag_ = 0;   // es ist etwas zu spielen
-    volatile int32_t fertig_  = 0;   // nichts kommt mehr nach
-    volatile int32_t abbruch_ = 0;   // Taste gedrueckt, Rest verwerfen
+    volatile int32_t auftrag_    = 0;   // es ist etwas zu spielen
+    volatile int32_t fertig_     = 0;   // nichts kommt mehr nach
+    volatile int32_t abbruch_    = 0;   // Taste gedrueckt, Rest verwerfen
+    volatile int32_t stockungen_ = 0;   // Ring lief mitten im Sprechen leer
 
     // 2048 Byte sind 1024 Frames und damit genau ein write_mono().
     static const size_t kLeseBytes = 2048;

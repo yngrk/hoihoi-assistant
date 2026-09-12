@@ -4,9 +4,7 @@
 #include <string.h>
 
 #include <cJSON.h>
-#include <esp_crt_bundle.h>
 #include <esp_heap_caps.h>
-#include <esp_http_client.h>
 #include <esp_log.h>
 #include <esp_timer.h>
 #include <freertos/task.h>
@@ -58,6 +56,19 @@ esp_err_t Chat::begin(Stt *quelle, const char *key, const char *model)
     // Was vor dem Start schon im Stt stand, ist keine neue Aeusserung. Ohne
     // diese Zeile beantwortete das Geraet nach jedem Neustart die letzte
     // Frage von vorher noch einmal.
+    // Vorwaerm-Adresse aus dem Modellnamen: derselbe Host, eine kleine
+    // Antwort, kein Verbrauch. Selbst ein unbekanntes Modell ist recht — eine
+    // 404 haelt die Verbindung genauso offen wie eine 200, und gebraucht wird
+    // hier nur der Socket darunter.
+    snprintf(waerm_, sizeof(waerm_), "https://api.openai.com/v1/models/%s", model_);
+
+    const esp_err_t werr = weg_.begin(kUrl, waerm_, key_, "text/event-stream",
+                                      kAntwortWarteMs);
+    if (werr != ESP_OK) {
+        phase_ = (int32_t)Phase::Fehler;
+        return werr;
+    }
+
     gesehen_ = quelle_->final_seq();
     phase_   = (int32_t)Phase::Bereit;
 
@@ -108,7 +119,65 @@ void Chat::set_frage(const char *s)
     snprintf(frage_, sizeof(frage_), "%s", (s != nullptr) ? s : "");
     antwort_[0]  = '\0';
     antwort_len_ = 0;
+    fertig_bis_  = 0;
     xSemaphoreGive(lock_);
+
+    // Erst danach hochzaehlen: wer auf den Wechsel wartet, soll den neuen
+    // Stand schon vorfinden und nicht den halben alten.
+    runde_seq_++;
+}
+
+size_t Chat::fertig_bis() const
+{
+    xSemaphoreTake(lock_, portMAX_DELAY);
+    const size_t n = fertig_bis_;
+    xSemaphoreGive(lock_);
+    return n;
+}
+
+void Chat::ausschnitt(size_t von, size_t bis, char *out, size_t n) const
+{
+    if (out == nullptr || n == 0) return;
+    out[0] = '\0';
+
+    xSemaphoreTake(lock_, portMAX_DELAY);
+    if (bis > antwort_len_) bis = antwort_len_;
+    if (von < bis) {
+        size_t m = bis - von;
+        if (m > n - 1) m = n - 1;
+        memcpy(out, antwort_ + von, m);
+        out[m] = '\0';
+    }
+    xSemaphoreGive(lock_);
+}
+
+// Satzgrenzen der laufenden Antwort. Laeuft unter lock_.
+//
+// Ein Satzzeichen zaehlt nur dann als Ende, wenn ein Leerzeichen folgt — und
+// das zuletzt empfangene Zeichen zaehlt nie, denn was danach kommt, weiss man
+// noch nicht. So bleibt der Punkt in "3. Mai" kein Satzende, solange die
+// Ziffer noch allein dasteht.
+void Chat::grenzen_nachfuehren(bool schluss)
+{
+    if (schluss) {
+        fertig_bis_ = antwort_len_;
+        return;
+    }
+
+    for (size_t i = fertig_bis_; i + 1 < antwort_len_; i++) {
+        const char c = antwort_[i];
+        if (c != '.' && c != '!' && c != '?') continue;
+
+        const char n = antwort_[i + 1];
+        if (n != ' ' && n != '\n') continue;
+        if (i + 1 - fertig_bis_ < kMinSatz) continue;
+
+        fertig_bis_ = i + 1;
+    }
+
+    if (fertig_bis_ > 0 && satz1_ms_ == 0 && runde_us_ != 0) {
+        satz1_ms_ = (int32_t)((esp_timer_get_time() - runde_us_) / 1000);
+    }
 }
 
 void Chat::append_antwort(const char *s)
@@ -122,6 +191,7 @@ void Chat::append_antwort(const char *s)
         memcpy(antwort_ + antwort_len_, s, n);
         antwort_len_ += n;
         antwort_[antwort_len_] = '\0';
+        grenzen_nachfuehren(false);
     }
     xSemaphoreGive(lock_);
 }
@@ -211,11 +281,13 @@ void Chat::sse_line(const char *line)
 void Chat::frage_stellen(const char *frage)
 {
     set_frage(frage);
-    phase_    = (int32_t)Phase::Fragt;
-    sse_done_ = false;
-    zeile_n_  = 0;
+    phase_     = (int32_t)Phase::Fragt;
+    sse_done_  = false;
+    zeile_n_   = 0;
+    satz1_ms_  = 0;
 
     const int64_t t0 = esp_timer_get_time();
+    runde_us_        = t0;
 
     // Rumpf ueber cJSON und nicht ueber snprintf: im erkannten Satz koennen
     // Anfuehrungszeichen stehen, und ein selbst gebautes Maskieren waere
@@ -254,61 +326,47 @@ void Chat::frage_stellen(const char *frage)
         return;
     }
 
-    esp_http_client_config_t cfg = {};
-    cfg.url                 = kUrl;
-    cfg.method              = HTTP_METHOD_POST;
-    cfg.crt_bundle_attach   = esp_crt_bundle_attach;
-    cfg.timeout_ms          = kAntwortWarteMs;
-    cfg.buffer_size         = 1024;
-    cfg.buffer_size_tx      = 2048;
-
-    esp_http_client_handle_t c = esp_http_client_init(&cfg);
-    if (c == nullptr) {
-        free(rumpf);
-        phase_ = (int32_t)Phase::Fehler;
-        return;
-    }
-
-    char auth[256];
-    snprintf(auth, sizeof(auth), "Bearer %s", key_);
-    esp_http_client_set_header(c, "Content-Type", "application/json");
-    esp_http_client_set_header(c, "Authorization", auth);
-    esp_http_client_set_header(c, "Accept", "text/event-stream");
-
     const int laenge = (int)strlen(rumpf);
-    esp_err_t err = esp_http_client_open(c, laenge);
-
-    if (err == ESP_OK && esp_http_client_write(c, rumpf, laenge) != laenge) {
-        err = ESP_FAIL;
-    }
+    const int status = weg_.senden(rumpf, laenge);
     free(rumpf);
 
-    if (err == ESP_OK && esp_http_client_fetch_headers(c) < 0) err = ESP_FAIL;
+    // Sauber heisst: der Rumpf ist bis zum Ende gelesen. Nur dann darf die
+    // Verbindung fuer die naechste Frage stehen bleiben.
+    bool sauber = false;
 
-    const int status = (err == ESP_OK) ? esp_http_client_get_status_code(c) : 0;
-
-    if (err == ESP_OK && status == 200) {
-        // Nicht bis "complete_data_received" warten: bei einem Ereignisstrom
-        // ist das Ende der Daten das Ende der Verbindung, und [DONE] steht
-        // davor. Wer auf den Verbindungsabbau wartet, verschenkt die letzte
-        // Sekunde.
+    if (status == 200) {
+        // Nicht auf den Verbindungsabbau warten: bei einem Ereignisstrom
+        // steht [DONE] vor dem Schluss, und wer auf das Ende des Sockets
+        // wartet, verschenkt die letzte Sekunde.
         while (!sse_done_) {
-            const int r = esp_http_client_read(c, lese_, kLeseBytes);
+            const int r = weg_.lesen(lese_, kLeseBytes);
             if (r <= 0) break;
             sse_feed(lese_, r);
         }
-    } else if (err == ESP_OK) {
+        // Nach [DONE] steht nur noch der Schlusschunk aus. Er liegt in aller
+        // Regel schon im selben Paket; kommt er nicht, ist die Verbindung
+        // eben weg, und das kostet weniger als darauf zu warten.
+        if (sse_done_) {
+            weg_.leerlesen(300);
+            sauber = weg_.vollstaendig();
+        }
+    } else if (status != 0) {
         // Der Fehlerrumpf ist JSON mit Klartext darin — bei falschem
         // Schluessel oder unbekanntem Modell steht dort genau, was fehlt.
-        const int r = esp_http_client_read(c, lese_, kLeseBytes - 1);
+        const int r = weg_.lesen(lese_, kLeseBytes - 1);
         if (r > 0) lese_[r] = '\0'; else lese_[0] = '\0';
         ESP_LOGE(TAG, "HTTP %d: %s", status, lese_);
-    } else {
-        ESP_LOGE(TAG, "Verbindung fehlgeschlagen: %s", esp_err_to_name(err));
+        weg_.leerlesen(300);
+        sauber = weg_.vollstaendig();
     }
 
-    esp_http_client_close(c);
-    esp_http_client_cleanup(c);
+    weg_.abschluss(sauber);
+
+    // Was noch kein ganzer Satz war, ist jetzt einer: hier endet die Antwort,
+    // und der Rest muss gesprochen werden, auch ohne Punkt am Schluss.
+    xSemaphoreTake(lock_, portMAX_DELAY);
+    grenzen_nachfuehren(true);
+    xSemaphoreGive(lock_);
 
     last_ms_ = (int32_t)((esp_timer_get_time() - t0) / 1000);
 
@@ -316,10 +374,12 @@ void Chat::frage_stellen(const char *frage)
     copy_antwort(antwort, sizeof(antwort));
 
     if (antwort[0] != '\0') {
-        verlauf_anfuegen(frage, antwort);
         antwort_seq_++;
         phase_ = (int32_t)Phase::Bereit;
-        ESP_LOGI(TAG, "Antwort nach %d ms: %s", (int)last_ms_, antwort);
+        ESP_LOGI(TAG, "Antwort nach %d ms (erster Satz nach %d ms, %d Wechsel "
+                      "Verlauf): %s",
+                 (int)last_ms_, (int)satz1_ms_, hist_n_, antwort);
+        verlauf_anfuegen(frage, antwort);
     } else {
         phase_ = (int32_t)Phase::Fehler;
         ESP_LOGW(TAG, "Keine Antwort nach %d ms.", (int)last_ms_);
@@ -329,6 +389,19 @@ void Chat::frage_stellen(const char *frage)
 void Chat::run()
 {
     while (true) {
+        // Vorgewaermt wird, sobald das Netz steht — nicht erst, wenn jemand
+        // spricht. Der Handschlag kostet auf diesem Geraet ueber eine
+        // Sekunde, und wenn Chat und Stimme gleichzeitig aufbauen, ueber
+        // vier: beim ersten Tastendruck nach dem Einschalten war er damit
+        // noch nicht fertig und verzoegerte genau die Frage, die er
+        // beschleunigen sollte. Beim Hochfahren hat dieser Task nichts zu
+        // tun, also gehoert er dorthin.
+        //
+        // Danach kostet der Aufruf nichts: vorwaermen() kehrt sofort
+        // zurueck, solange die Verbindung als stehend gilt, und hat nach
+        // einem Fehlschlag eine Sperrzeit.
+        if (net::connected()) weg_.vorwaermen();
+
         const uint32_t jetzt = quelle_->final_seq();
 
         if (jetzt != gesehen_) {

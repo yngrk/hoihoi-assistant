@@ -252,6 +252,16 @@ static void test_display(void)
 
     rlcd.RLCD_Init();
 
+    // Den Bildpuffer aus dem PSRAM holen, bevor das erste Bild laeuft: sonst
+    // legt spi_master bei jedem Bild 15 KB internen Zwischenspeicher an und
+    // gibt sie wieder her, und der Treiber bricht ab, wenn das einmal nicht
+    // klappt. Siehe display_sync.h.
+    const esp_err_t dmabuf = rlcd.pin_buffer_to_dma();
+    if (dmabuf != ESP_OK) {
+        ESP_LOGW(TAG, "  Bildpuffer bleibt im PSRAM (%s).",
+                 esp_err_to_name(dmabuf));
+    }
+
     // Vor dem ersten Bild: ohne diese Rueckmeldung wuerde der Zeichencode in
     // den noch laufenden DMA-Transfer hineinschreiben.
     const esp_err_t dma = rlcd.enable_transfer_wait();
@@ -747,16 +757,24 @@ static void draw_listening(void)
     }
 }
 
+// Laeuft gerade eine Aufnahme oder eine Erkennung? Ohne Nachlauf — die Frage
+// ist, ob das Geraet in diesem Augenblick zuhoert, nicht ob es das eben noch
+// tat.
+static bool aufnahme_laeuft(void)
+{
+    return listener.listening()
+           || stt.phase() == Stt::Phase::Verbindet
+           || stt.phase() == Stt::Phase::Hoert
+           || stt.phase() == Stt::Phase::Wartet;
+}
+
 // Welche Ansicht das obere Band zeigt. Waehrend und kurz nach einer Aufnahme
 // die Aufnahmeansicht, sonst die Kennzahlen.
 static bool aufnahme_ansicht(void)
 {
     static int64_t bis = 0;
 
-    const bool aktiv = listener.listening()
-                       || stt.phase() == Stt::Phase::Verbindet
-                       || stt.phase() == Stt::Phase::Hoert
-                       || stt.phase() == Stt::Phase::Wartet;
+    const bool aktiv = aufnahme_laeuft();
 
     const int64_t jetzt = esp_timer_get_time();
     if (aktiv) {
@@ -865,9 +883,19 @@ static void draw_scope(const int16_t *lo, const int16_t *hi, int head,
 {
     display->clear(ColorWhite);
 
-    // Die Antwort geht vor: sie kommt spaeter als die Aufnahme und loest sie
-    // damit sauber ab, ohne dass eine der beiden Ansichten von der anderen
-    // wissen muesste.
+    // Die laufende Aufnahme geht allem vor. Die Antwort bleibt nach dem
+    // letzten Wort noch acht Sekunden stehen, damit man sie lesen kann — wer
+    // in dieser Zeit die Sprechtaste drueckt, bekam aber bisher kein Bild
+    // davon und hielt das Geraet fuer taub. Nachfragen ist der Normalfall,
+    // nicht die Ausnahme.
+    if (aufnahme_laeuft() && !net::provisioning()) {
+        draw_listening();
+        display->flush();
+        return;
+    }
+
+    // Danach die Antwort: sie kommt spaeter als die Aufnahme und loest deren
+    // Nachlauf sauber ab.
     if (antwort_ansicht() && !net::provisioning()) {
         draw_answer();
         display->flush();
@@ -999,13 +1027,18 @@ static void stats_task(void *)
 }
 
 
-static void visualize_mic(void)
+static void audio_task(void *);
+
+// Richtet alles ein, was zum Aufnehmen, Erkennen, Antworten und Sprechen
+// gehoert, und uebergibt den Takt danach an audio_task(). true heisst: es
+// laeuft, der Haupttask wird nicht mehr gebraucht.
+static bool visualize_mic(void)
 {
     ESP_LOGI(TAG, "--- Mikrofon-Visualisierung ---");
 
     if (mic.begin(i2c_bus, kSampleRate) != ESP_OK) {
         ESP_LOGE(TAG, "  Mikrofon nicht verfuegbar, Visualisierung entfaellt.");
-        return;
+        return false;
     }
 
     memset(col_min, 0, sizeof(col_min));
@@ -1014,7 +1047,7 @@ static void visualize_mic(void)
     scope_lock = xSemaphoreCreateMutex();
     if (scope_lock == nullptr) {
         ESP_LOGE(TAG, "  Mutex konnte nicht angelegt werden.");
-        return;
+        return false;
     }
 
     ESP_LOGI(TAG, "  %d Hz, %d Frames je Spalte, %d Spalten = %.1f s Bildbreite.",
@@ -1087,6 +1120,38 @@ static void visualize_mic(void)
                  esp_err_to_name(terr));
     }
 
+    // Der Aufnahmetakt bekommt einen eigenen Task, auf dem zweiten Kern und
+    // ueber der Anzeige.
+    //
+    // Er lief bisher im Haupttask, und der hat Prioritaet 1 auf Kern 0 —
+    // unter allem, was das Netz anfasst. Waehrend einer Aufnahme laufen dort
+    // bis zu drei TLS-Handschlaege gleichzeitig (Erkennung, Chat, Stimme),
+    // jeder ueber eine Sekunde reine Rechenarbeit auf Prioritaet 3. Der
+    // Aufnahmetakt kam in dieser Zeit nicht mehr dran, der I2S-Ring lief
+    // ueber, und eine Aufnahme von zweieinhalb Sekunden endete als
+    //
+    //   listen: Zuhoeren beendet (Taste losgelassen): 2477 ms, 0 Frames
+    //   stt: Dienstfehler: ... buffer only has 0.00ms of audio.
+    //
+    // obwohl der Pegelmesser im selben Augenblick Sprache zeigte: die paar
+    // Bloecke, die durchkamen, reichten fuer den Messwert, nicht fuer den
+    // Mitschnitt. Der Ring fasst 60 ms — wer ihn leert, darf nicht warten
+    // muessen. Kern 1 hat ausser der Anzeige nichts zu tun, und dort steht
+    // der Aufnahmetakt ueber ihr: ein ausgelassenes Bild faellt nicht auf,
+    // eine verlorene Silbe schon.
+    if (xTaskCreatePinnedToCore(audio_task, "audio", 4096, nullptr, 6, nullptr, 1)
+            != pdPASS) {
+        ESP_LOGE(TAG, "  Aufnahmetask konnte nicht angelegt werden.");
+        return false;
+    }
+    return true;
+}
+
+// Der Aufnahmetakt selbst: Taste abfragen, einen Block lesen, ihn an den
+// Mitschnitt weiterreichen, Wellenbild und Pegel nachfuehren. Zwanzig
+// Millisekunden je Durchgang, und die bleiben es auch unter Last.
+static void audio_task(void *)
+{
     static int16_t block[kReadFrames];
     int64_t        sum_sq    = 0;
     int32_t        sum_count = 0;
@@ -1107,7 +1172,32 @@ static void visualize_mic(void)
         // man glauben muessen darf: zwischen den Aufnahmen ist der ES7210
         // zugeklappt, nicht nur ungelesen.
         if (listener.listening() && !mic.running()) {
+            // Wer die Sprechtaste drueckt, will sprechen und nicht zuhoeren.
+            // Die laufende Antwort muss dabei nicht nur aufhoeren, sie muss
+            // den I2S-Port auch *vorher* freigeben: Mikrofon und Lautsprecher
+            // haengen an derselben Datenschnittstelle, und wer sie im selben
+            // Augenblick oeffnet und schliesst, bekommt eine Aufnahme mit
+            // null Frames — die Nachfrage ginge verloren.
+            const int64_t t_taste = esp_timer_get_time();
+            int           runden  = 0;
+            if (tts.spricht()) {
+                tts.abbrechen();
+                for (; runden < 100 && tts.spricht(); runden++) {
+                    vTaskDelay(pdMS_TO_TICKS(5));
+                }
+            }
+            const int wartems = (int)((esp_timer_get_time() - t_taste) / 1000);
             mic.start();
+
+            // Die Uebergabe kostet Aufnahmezeit: bis das Mikrofon steht,
+            // faellt alles Gesprochene weg. Zwei Zahlen, weil sie zwei
+            // verschiedene Fehler auseinanderhalten — viele Runden heisst,
+            // der Lautsprecher gibt den Port nicht her; wenige Runden bei
+            // langer Zeit heisst, dieser Task kam nicht dran.
+            if (wartems > 20) {
+                ESP_LOGW(TAG, "  Uebergabe an das Mikrofon: %d ms in %d Runden.",
+                         wartems, runden);
+            }
         } else if (!listener.listening() && mic.running()) {
             mic.stop();
 
@@ -1256,7 +1346,11 @@ extern "C" void app_main(void)
     init_inputs();
 
     vTaskDelay(pdMS_TO_TICKS(1500));   // Testbild kurz stehen lassen
-    visualize_mic();
+
+    // Laeuft die Aufnahme in ihrem eigenen Task, hat der Haupttask nichts
+    // mehr zu tun. Er darf zurueckkehren; die IDF raeumt ihn dann samt
+    // seinen acht Kilobyte Stack ab.
+    if (visualize_mic()) return;
 
     // Nur erreichbar, wenn das Mikrofon nicht ansprechbar war.
     ESP_LOGI(TAG, "--- Laufende Ueberwachung (Tasten + Batterie) ---");

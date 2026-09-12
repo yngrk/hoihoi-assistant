@@ -83,8 +83,14 @@ src/display_sync.h, .cpp  DisplayPort mit Rückmeldung über das DMA-Ende
 src/font5x7.h, .cpp       5×7-Bitmapfont, ASCII 0x20–0x7F plus ä ö ü ß
 src/audio.h, src/audio.cpp  ES7210 und ES8311 im Vollduplex an einem I²S-Port
 src/listen.h, .cpp        Zuhören auf Tastendruck, Mitschnitt im PSRAM
+src/logview.h, .cpp       ESP-Log zusätzlich auf das Display
 src/net.h, .cpp           WLAN im Stationsbetrieb
+src/cfg.h, .cpp           Zugangsdaten im NVS
+src/prov.h, .cpp          Einrichtung über BLE
+src/verbindung.h, .cpp    Stehende HTTPS-Verbindung zu api.openai.com
 src/stt.h, .cpp           Sprache zu Text über die Realtime-API von OpenAI
+src/chat.h, .cpp          Text zu Antwort, als Strom
+src/tts.h, .cpp           Antwort zu Sprache, satzweise
 src/secrets.h.example     Vorlage für WLAN-Zugang und API-Schlüssel
 src/idf_component.yml     esp_codec_dev und esp_websocket_client
 components/port_bsp/      ST7305-Treiber von Waveshare, eine Zeile geändert
@@ -325,26 +331,52 @@ Datenobjekt: sechs Aufnahmen, sechs Wiedergaben, kein Lesefehler.
 
 Der ES7210 wird in `MicInput::start()` geöffnet und in `stop()` wieder
 geschlossen, nicht einmalig beim Hochfahren. Zwischen den Aufnahmen
-digitalisiert er nichts. Ein Gerät mit Mikrofon soll nicht dauerhaft zuhören,
-und ob es das tut, darf man nicht glauben müssen — es ist derselbe Baustein,
-der sonst läuft. Das Öffnen kostet gemessen 26 bis 53 ms und fällt beim
+digitalisiert er nichts. Das Öffnen kostet gemessen 26 bis 53 ms und fällt beim
 Tastendruck nicht auf; im Log steht `MIK=AN` beziehungsweise `MIK=aus`.
+
+Das ist eine Etappenentscheidung, kein Grundsatz: das fertige Gerät soll auf
+ein Weckwort hören und muss dafür dauerhaft digitalisieren. Solange es das noch
+nicht tut, ist „das Mikrofon ist zu" die ehrlichere Aussage — und sie ist an
+derselben Stelle im Code ablesbar, an der es später aufgeht.
 
 Die Verstärkung steht auf 37,5 dB, dem Maximum des ES7210 (0 bis 33 dB in
 Dreierschritten, dann 34,5, 36, 37,5). Sie anzuheben hat den Störabstand nicht
 verbessert — Rauschteppich und Signal steigen gemeinsam —, aber sie kostet auch
 nichts.
 
-### Wiedergabe als Diagnosemittel
+### Der Lautsprecher
 
-Nach dem Loslassen spielt das Gerät die Aufnahme über den ES8311 zurück. Das
-ist kein Bestandteil des Endprodukts, sondern das einzige Mittel, mit dem sich
-beurteilen lässt, was das Mikrofon tatsächlich aufgenommen hat.
+Die Wiedergabe der eigenen Aufnahme war eine Zeitlang das einzige Mittel, um zu
+beurteilen, was das Mikrofon tatsächlich aufnimmt. Sie ist wieder heraus — der
+Lautsprecher trägt jetzt die Antwort, und ein Gerät, das erst die Frage
+wiederholt und dann antwortet, ist eine Zumutung.
 
-`volume` bei `esp_codec_dev` ist dabei kein Leistungsanteil, sondern ein Punkt
-auf einer Kurve, die 0 bis 100 linear auf −50 bis 0 dB abbildet. Der
+`volume` bei `esp_codec_dev` ist kein Leistungsanteil, sondern ein Punkt auf
+einer Kurve, die 0 bis 100 linear auf −50 bis 0 dB abbildet. Der
 zwischenzeitliche Wert 70 waren also nicht „etwas leiser", sondern −15 dB, und
 genau so klang es.
+
+### Die Übergabe des Ports zwischen Stimme und Mikrofon
+
+Beide Wandler hängen an *einer* Datenschnittstelle, und `esp_codec_dev` führt
+darin Buch, welche Richtung läuft. Wer während einer Antwort die Sprechtaste
+drückt, lässt beide im selben Augenblick daran drehen: das Mikrofon öffnet den
+Empfangskanal, während die Stimme den Sendekanal zurückgibt. Im Mitschnitt
+stand das als
+
+```
+I (77249) listen: Zuhoeren gestartet.
+E (77249) i2s_common: i2s_channel_disable: the channel has not been enabled yet
+I (77454) listen: Zuhoeren beendet: 205 ms, 0 Frames, Spitze 0
+```
+
+— und eine Aufnahme mit null Frames heißt: die Nachfrage ist weg. Zwei Dinge
+halten das jetzt auseinander. Ein Mutex um jedes `esp_codec_dev_open()` und
+`_close()`, damit sich die beiden Vorgänge nicht überlappen. Und eine
+Reihenfolge: der Aufnahmetask bricht die Ausgabe ab und **wartet**, bis der
+Lautsprecher den Port abgegeben hat, bevor er das Mikrofon öffnet. Das kostet
+rund 60 ms und ist der Unterschied zwischen „nachfragen geht" und „nachfragen
+geht nicht".
 
 ## Sprache zu Text
 
@@ -362,7 +394,7 @@ nicht. Fünf Sekunden Sprechen kosten damit rund 0,00025 $.
 
 ```
 wss://api.openai.com/v1/realtime?intent=transcription
-  Authorization: Bearer <key>,  OpenAI-Beta: realtime=v1
+  Authorization: Bearer <key>
   -> session.update             Format, Modell, Sprache, turn_detection: null
   -> input_audio_buffer.append  Base64-PCM16
   -> input_audio_buffer.commit  beim Loslassen der Taste
@@ -372,6 +404,12 @@ wss://api.openai.com/v1/realtime?intent=transcription
 
 `turn_detection` bleibt aus: Anfang und Ende bestimmt die Taste, nicht eine
 Stimmerkennung auf der Gegenseite.
+
+**Kein `OpenAI-Beta: realtime=v1`.** Der Header stand hier, solange die API in
+der Beta war, und blieb danach stehen. Er ist nicht bloss ueberfluessig, sondern
+der Grund fuer die Ablehnung: *"The Realtime Beta API is no longer supported.
+Please use /v1/realtime for the GA API."* Die Erkennung war damit tot, waehrend
+alles andere unveraendert aussah.
 
 [src/stt.h](src/stt.h) hängt sich an den `Listener` und macht den Rest allein —
 Tastendruck bemerken, Verbindung aufbauen, nachschicken, was während des
@@ -411,6 +449,188 @@ Der Font kennt dafür vier zusätzliche Zeichen: ä, ö, ü und ß. Die großen
 Umlaute passen nicht in sieben Zeilen und werden zu Ae, Oe, Ue umgeschrieben,
 alles andere außerhalb von ASCII wird ein Fragezeichen.
 
+## Von der Frage zur Antwort
+
+Drei Aufrufe, nicht einer. Es gäbe eine Sprache-zu-Sprache-Sitzung, die alles
+in einem macht und unter einer Sekunde antwortet — sie kostet aber das
+Fünfzig- bis Hundertfache je Runde, und vor allem fiele der Text unterwegs
+weg. Auf einem Gerät, dessen Hauptausgabe ein Display ist, ist der Text nicht
+das Nebenprodukt, sondern der Zweck.
+
+```
+Taste  --> stt.cpp --> chat.cpp --> tts.cpp --> Lautsprecher
+           wss:.../realtime  POST /v1/chat/completions  POST /v1/audio/speech
+           Teiltext          Strom aus Satzstuecken     PCM 24 kHz roh
+```
+
+Jeder Schritt hängt am vorigen über einen Zähler, nicht über einen Aufruf:
+`Stt::final_seq()` wechselt, wenn ein Endtext dasteht, `Chat::runde_seq()`,
+wenn eine neue Antwort beginnt. Damit läuft jeder Schritt in seinem eigenen
+Task, und keiner wartet auf den anderen, solange es nichts zu tun gibt.
+
+**Der Systemhinweis ist Gerätekunde.** Der Font kennt ASCII plus ä ö ü ß,
+sonst nichts; eine Antwort mit Aufzählungszeichen, typografischen
+Anführungsstrichen oder einem Emoji wäre auf diesem Display eine Reihe
+Fragezeichen. Der Hinweis verbietet sie deshalb ausdrücklich und bittet um
+höchstens drei Sätze — mehr passt nicht ins Band.
+
+**`response_format: "pcm"`** und nicht mp3 oder opus: das Format ist dann
+genau das, was der ES8311 ohnehin bekommt — 24 kHz, 16 Bit, mono, Little
+Endian, ohne Kopf. Ein Decoder auf dem Gerät entfällt vollständig, und mit ihm
+die Frage, ob er schnell genug ist. Der Preis sind 48 KB je Sekunde statt 4.
+
+### Warum der Ton geknackt hat
+
+Der erste Entwurf schrieb den Ton direkt aus dem HTTP-Lesevorgang in den
+Wandler. Das knackte hörbar und unregelmäßig, und der Grund ist eine Zahl: der
+I2S-Treiber hält mit `I2S_CHANNEL_DEFAULT_CONFIG` sechs mal 240 Frames vor,
+bei 24 kHz also **60 Millisekunden**. Jede Stockung im Netz, die länger dauert
+als das — und über WLAN mit TLS sind hundert Millisekunden nichts Besonderes
+—, läuft der DMA leer, und ein leerer DMA klingt wie ein Knacken.
+
+Dazwischen liegt jetzt ein Ringpuffer im PSRAM, acht Sekunden groß: ein Task
+füllt ihn aus dem Netz, ein zweiter leert ihn in den Lautsprecher. Ein
+Schreiber, ein Leser, zwei frei laufende 32-Bit-Zähler — damit braucht es
+keine Sperre, und der Überlauf stört nicht, weil immer nur die Differenz
+gebildet wird. Am Schluss gehen 20 ms Stille hinterher: ein Wandler, der
+mitten im Signal stehenbleibt, tut das mit einem Knacks.
+
+## Antwortzeit
+
+Gemessen vom Loslassen der Taste bis zum ersten Ton, dieselbe Frage vorher und
+nachher:
+
+| Abschnitt | vorher ms | jetzt ms |
+|---|---:|---:|
+| Loslassen → Endtext | 536 | 699 |
+| Chat: TLS-Handschlag | 793 | — |
+| Chat: Anfrage → Antwort | 2320 | 1240 |
+| Stimme: TLS-Handschlag | 802 | — |
+| Stimme: erstes Byte + Vorlauf | 1745 | 964 |
+| **Summe** | **6196** | **2903** |
+
+Die interessante Zahl stand zweimal da. **1,6 Sekunden für zwei
+TLS-Handschläge**, beide zum selben Host, beide mitten auf dem Weg. Beide sind
+jetzt weg, und zwar durch zwei Dinge, die in
+[src/verbindung.h](src/verbindung.h) stehen:
+
+- **Stehen lassen.** `esp_http_client` baut nur dann neu auf, wenn der Zustand
+  unter `HTTP_STATE_CONNECTED` liegt. Wer die Antwort zu Ende liest und danach
+  *nicht* schließt, bekommt beim nächsten `open()` denselben Socket. Das setzt
+  voraus, dass wirklich alles gelesen wurde — beim Ereignisstrom des Chats
+  also auch der Schlusschunk hinter `[DONE]`, den der alte Code liegen ließ.
+- **Vorwärmen, sobald das WLAN steht.** Der Aufbau wird in eine Zeit
+  vorgezogen, in der ohnehin nichts zu tun ist: direkt nach dem Hochfahren.
+  Erst während der Aufnahme vorzuwärmen war zu knapp — ein Handschlag kostet
+  hier 0,8 bis 3 Sekunden, und wenn Chat und Stimme gleichzeitig aufbauen,
+  über vier; beim ersten Tastendruck nach dem Einschalten war er dann noch
+  nicht fertig und verzögerte genau die Frage, die er beschleunigen sollte.
+  Vorgewärmt wird mit einem `GET /v1/models/<modell>`; was es antwortet, ist
+  gleichgültig, auch eine 404 hält den Socket offen.
+
+Eine stehende Verbindung kann die Gegenseite jederzeit zumachen, ohne dass man
+es merkt. Deshalb gilt der erste fehlgeschlagene Versuch auf einer
+wiederverwendeten Verbindung nicht als Fehler, sondern als Anlass, einmal neu
+aufzubauen.
+
+**Satzweise sprechen.** Die Stimme wartete früher auf die vollständige Antwort
+und verschenkte damit rund anderthalb Sekunden, in denen der erste Satz längst
+fertig war. Jetzt meldet der Chat, wie viele Zeichen als *ganze Sätze*
+feststehen, und die Stimme holt, was da ist — die zweite Portion, während die
+erste noch läuft, in denselben Ring, ohne Naht dazwischen. Ein Satzzeichen
+gilt dabei nur als Ende, wenn ein Leerzeichen folgt und seit der letzten
+Grenze mindestens 16 Zeichen vergangen sind; sonst zerfiele "z. B." in zwei
+Portionen und jede kostete eine eigene Anfrage.
+
+**Der Vorlauf** ist der verbleibende Handel: er verzögert den ersten Ton um
+genau seine Länge und kauft dafür denselben Betrag an Stockungstoleranz. Von
+2 s auf 1,2 s heruntergesetzt — und damit das keine Glaubensfrage bleibt,
+zählt der Spieler mit, wie oft der Ring mitten im Sprechen leer lief:
+
+```
+I (...) tts: Gesprochen: 3100 ms Ton, erster Ton nach 964 ms, 0 Stockungen, 103 KB intern frei.
+```
+
+### Wer wem den Vortritt lässt
+
+Der Aufnahmetakt lief anfangs im Haupttask, und der hat in der IDF **Priorität
+1 auf Kern 0** — unter allem, was das Netz anfasst. Chat, Erkennung und Stimme
+liegen dort auf 3. Beim ersten Tastendruck nach dem Einschalten laufen die
+Handschläge aller drei gleichzeitig, jeder über eine Sekunde reine
+Rechenarbeit, und der Aufnahmetakt kam in dieser Zeit nicht mehr dran. Der
+I2S-Ring fasst 60 ms; alles darüber hinaus verfällt. Das Ergebnis:
+
+```
+I (45512) listen: Zuhoeren gestartet.
+I (46333) bringup: Pegel rms=  207  peak= 7737   |  Bild 36/44 ms, 38/s
+I (47520) bringup: Pegel rms=   20  peak=   52   |  Bild 0/0 ms, 0/s
+I (47989) listen: Zuhoeren beendet: 2477 ms, 0 Frames, Spitze 0
+E (48175) stt: Dienstfehler: ... buffer only has 0.00ms of audio.
+```
+
+Zweieinhalb Sekunden Aufnahme, null Frames — und der Pegelmesser zeigte im
+selben Augenblick Sprache an. Die paar Blöcke, die durchkamen, reichten für
+den Messwert, nicht für den Mitschnitt.
+
+Der Aufnahmetakt hat deshalb einen eigenen Task, **Priorität 6 auf Kern 1**,
+über der Anzeige. Kern 1 hat außer dem Zeichnen nichts zu tun, und die
+Reihenfolge dort stimmt: ein ausgelassenes Bild fällt nicht auf, eine
+verlorene Silbe schon. Der Haupttask kehrt danach zurück; die IDF räumt ihn
+samt seinen acht Kilobyte Stack ab.
+
+Die Anzeige stockt unter drei gleichzeitigen Handschlägen weiterhin sichtbar
+(`Bild 113/1177 ms, 15/s` für eine Sekunde). Das kostet nichts als Glätte und
+steht unter den offenen Punkten.
+
+### Was das Gespräch zusammenhält
+
+Sechs Frage-Antwort-Wechsel gehen bei jeder Anfrage wieder mit hinaus. Das
+Gerät hat eine Sprechtaste und keinen sichtbaren Faden — wer nachfragt,
+bezieht sich fast immer auf das Vorige. Im Log steht mit jeder Antwort, wie
+viele Wechsel mitgingen; ohne diese Zahl wäre nicht zu unterscheiden, ob der
+Verlauf fehlt oder das Modell ihn ignoriert.
+
+```
+I (63172) stt: Endtext: Kannst du sie benennen?
+I (65485) chat: Antwort nach 2311 ms (erster Satz nach 0 ms, 2 Wechsel Verlauf):
+                Ja, sie heissen Merkur, Venus, Erde, Mars, ...
+```
+
+Wer während einer laufenden Antwort die Taste drückt, bricht sie ab — wer
+spricht, will nicht zuhören. Die Erkennung schließt dann auch eine Sitzung,
+die noch auf ihren Endtext wartet; ohne das bliebe eine offene Verbindung
+stehen, deren Ereignisse weiterhin hereinkämen.
+
+**Die Sitzung darf langsamer sein als der Tastendruck.** Eine Erkennungssitzung
+aufzubauen dauert rund 1,9 Sekunden — 0,8 s TLS, der Rest WebSocket-Aufstieg
+und die Antwort auf `transcription_session.update`. Wer kurz nachfragt, lässt
+vorher los. Früher endete das an dieser Stelle mit `Sitzung beendet (ohne
+Sitzung)`, und die anderthalb Sekunden Aufnahme, die sauber im PSRAM lagen,
+waren weg — ohne Antwort und ohne ein Zeichen, dass überhaupt etwas angekommen
+war. Das Loslassen setzt den Abschluss jetzt nur auf *offen*; das `commit`
+geht hinaus, sobald die Sitzung steht und der letzte Frame drüben ist.
+Aufgegeben wird erst nach fünf Sekunden.
+
+## Log auf dem Display
+
+`esp_log_set_vprintf()` gibt den bisherigen Handler zurück. Damit lässt sich
+das Log *abzweigen* statt umzuleiten: der Hook reicht zuerst an den alten
+Handler weiter und legt sich danach eine Kopie in einen Ring von 40 Zeilen.
+Die serielle Diagnose bleibt dabei vollständig erhalten.
+
+Das Log ist die Standardansicht, nicht die Kennzahlen — das Wellenband ist
+leer, solange das Mikrofon zu ist, und das ist die meiste Zeit. BOOT schaltet
+um; während der Einrichtung gewinnt immer die Kennzahlenansicht, weil nur dort
+Gerätename und Nachweis stehen.
+
+Zwei Dinge waren dabei nicht offensichtlich. Der **`sys_evt`-Task hat 2304
+Byte Stack**, und der Hook läuft auch in ihm — deshalb ein Zwischenpuffer von
+160 Byte und nichts Größeres. Und der Pegel-Herzschlag schreibt 200 Zeichen je
+Sekunde; er füllt 28 Zeilen in einer halben Minute. Statt die Zeile zu
+streichen, kann `logview::mute()` einzelne Anfänge unterdrücken — im Log auf
+der seriellen Schnittstelle stehen sie weiter.
+
+
 ## Offene Punkte
 
 - **Controller-Bezeichnung**: Waveshare und die ESPHome-Komponente nennen den
@@ -432,4 +652,16 @@ alles andere außerhalb von ASCII wird ein Fragezeichen.
   selbst trainiertes Modell nach Art von microWakeWord, das aus
   TTS-erzeugten Beispielen entsteht und sprecherunabhängig arbeitet, dafür aber
   eine Trainingspipeline außerhalb der Firmware braucht.
+- **Stockende Anzeige beim ersten Handschlag**: laufen Erkennung, Chat und
+  Stimme gleichzeitig durch ihren TLS-Aufbau, fällt die Bildrate für rund eine
+  Sekunde auf 15/s, einzelne Bilder brauchen über eine Sekunde. Die Aufnahme
+  ist davon nicht mehr betroffen, die Anzeige schon. Der Anzeigetask läuft auf
+  Kern 1, die Handschläge auf Kern 0 — die Kopplung dürfte über die
+  Heap-Sperre laufen, die mbedTLS mit `CONFIG_MBEDTLS_DYNAMIC_BUFFER` stark
+  belastet. Nicht nachgemessen.
+- **Erkennungssitzung vorwärmen**: der WebSocket wird bei jedem Tastendruck
+  neu aufgebaut und kostet 1,9 s — die größte verbliebene Einzelzeit. Chat und
+  Stimme halten ihre Verbindung stehen; für die Erkennung wäre dasselbe
+  möglich, braucht aber eine Antwort darauf, wie lange die Gegenseite eine
+  unbenutzte Transkriptionssitzung offen lässt.
 - **microSD und RTC**: noch nicht angebunden.

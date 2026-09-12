@@ -27,6 +27,14 @@ static const size_t kJsonBytes = kB64Bytes + 128;
 // Verbindung ohnehin geschlossen wird.
 static const int64_t kFinalWaitUs = 8 * 1000000;
 
+// Wie lange nach dem Loslassen noch auf eine Sitzung gewartet wird, die beim
+// Tastendruck aufgebaut wurde und bis zum Loslassen nicht fertig geworden
+// ist. Gemessen dauert der Aufbau rund 1,9 s — 0,8 s TLS, der Rest
+// WebSocket-Aufstieg und die Antwort auf transcription_session.update. Wer
+// kurz drueckt, laesst frueher los als das; die Aufnahme liegt dann
+// vollstaendig im PSRAM und wird nachgereicht, statt weggeworfen zu werden.
+static const int64_t kSitzungWarteUs = 5 * 1000000;
+
 esp_err_t Stt::begin(Listener *quelle, uint32_t sample_rate,
                      const char *key, const char *model, const char *language)
 {
@@ -308,14 +316,25 @@ void Stt::run()
     bool    konfiguriert = false;
     int64_t warte_seit = 0;
 
+    // Die Taste ist los, aber der Ton ist noch nicht drueben.
+    bool    abschluss_offen = false;
+    int64_t abschluss_frist = 0;
+
     while (true) {
         const bool aktiv = quelle_->listening();
 
         // --- Tastendruck: Verbindung aufbauen ---
         if (aktiv && !war_aktiv) {
-            gesendet_    = 0;
-            konfiguriert = false;
+            gesendet_       = 0;
+            konfiguriert    = false;
+            abschluss_offen = false;
             set_text("");
+
+            // Wer sofort nachfragt, drueckt die Taste, bevor die vorige
+            // Sitzung ihren Endtext hatte. Ohne diese Zeile ueberschriebe
+            // open_session() den alten Griff und liesse eine Sitzung offen,
+            // deren Ereignisse weiterhin hier hereinkaemen.
+            if (client_ != nullptr) close_session("ueberholt");
 
             if (!net::connected()) {
                 phase_ = (int32_t)Phase::Aus;
@@ -355,14 +374,36 @@ void Stt::run()
         }
 
         // --- Taste los: abschliessen ---
+        //
+        // Nicht sofort, sondern sobald der Ton tatsaechlich drueben ist. Der
+        // Aufbau einer Sitzung dauert rund 1,9 s, und wer kurz nachfragt,
+        // laesst vorher los. Frueher endete das hier mit
+        //
+        //   stt: Sitzung beendet (ohne Sitzung)
+        //
+        // und die anderthalb Sekunden Aufnahme, die sauber im PSRAM lagen,
+        // waren weg — ohne Antwort und ohne ein Zeichen, dass ueberhaupt
+        // etwas angekommen war. Der Nachschub-Block darueber holt den
+        // Rueckstand ohnehin auf, sobald die Sitzung steht; hier wird nur
+        // gewartet, bis er durch ist.
         if (!aktiv && war_aktiv) {
-            if (client_ != nullptr && sitzung_ok_) {
+            abschluss_offen = true;
+            abschluss_frist = esp_timer_get_time() + kSitzungWarteUs;
+        }
+
+        if (abschluss_offen) {
+            const bool alles_drueben = client_ != nullptr && sitzung_ok_
+                                       && gesendet_ >= quelle_->sample_count();
+            if (alles_drueben) {
                 send_json("{\"type\":\"input_audio_buffer.commit\"}");
-                phase_     = (int32_t)Phase::Wartet;
-                warte_seit = esp_timer_get_time();
-            } else {
+                phase_          = (int32_t)Phase::Wartet;
+                warte_seit      = esp_timer_get_time();
+                abschluss_offen = false;
+            } else if (client_ == nullptr
+                       || esp_timer_get_time() > abschluss_frist) {
                 close_session("ohne Sitzung");
-                phase_ = (int32_t)Phase::Bereit;
+                phase_          = (int32_t)Phase::Bereit;
+                abschluss_offen = false;
             }
         }
 

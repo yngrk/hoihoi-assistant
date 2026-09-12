@@ -39,6 +39,22 @@ class SyncDisplay : public DisplayPort {
     // RLCD_Display().
     esp_err_t enable_transfer_wait();
 
+    // Legt den Bildpuffer in DMA-faehigen internen Speicher um.
+    //
+    // Der Treiber legt ihn im PSRAM an, und daraus kann das SPI-DMA nicht
+    // lesen: spi_master besorgt sich deshalb bei *jedem* Bild einen eigenen
+    // internen Zwischenpuffer von 15 KB — siebenundzwanzigmal je Sekunde
+    // anlegen und wieder freigeben. Geht das einmal nicht, endet es nicht
+    // etwa mit einem ausgelassenen Bild, sondern mit
+    //
+    //   E spi_master: setup_dma_priv_buffer: Failed to allocate priv TX buffer
+    //   ESP_ERROR_CHECK failed: ESP_ERR_NO_MEM ... abort()
+    //
+    // im Treiber, und damit mit einem Neustart. Einmalig 15 KB intern beim
+    // Hochfahren kosten weniger als diese Unruhe — und die Anzeige haengt
+    // danach an keiner Speicherlage mehr.
+    esp_err_t pin_buffer_to_dma();
+
     // Schickt den Bildpuffer los und kehrt erst zurueck, wenn das DMA ihn
     // vollstaendig gelesen hat. Ab dann darf wieder hineingezeichnet werden.
     void send_and_wait();

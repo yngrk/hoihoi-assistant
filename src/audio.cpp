@@ -5,6 +5,8 @@
 #include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_timer.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 #include "esp_codec_dev_defaults.h"
 #include "user_config.h"
@@ -40,6 +42,20 @@ struct {
     uint32_t                     rate    = 0;
 } s_port;
 
+// Und weil es nur eine Datenschnittstelle gibt, darf auch nur einer zur Zeit
+// daran drehen. Aufnahme und Wiedergabe liegen in verschiedenen Tasks; wer
+// die Sprechtaste waehrend einer Antwort drueckt, laesst beide im selben
+// Augenblick los: das Mikrofon oeffnet den Empfangskanal, waehrend die Stimme
+// den Sendekanal zurueckgibt. Beide Vorgaenge aendern denselben Stand.
+// Im Mitschnitt stand das als "i2s_channel_disable: the channel has not been
+// enabled yet", und die Aufnahme danach hatte null Frames.
+SemaphoreHandle_t s_port_lock = nullptr;
+
+// Kein RAII-Wrapper: die vier Stellen sind kurz und stehen beieinander, und
+// ein eigener Typ dafuer waere mehr Code als die Sache gross ist.
+inline void port_sperren()   { if (s_port_lock) xSemaphoreTake(s_port_lock, portMAX_DELAY); }
+inline void port_freigeben() { if (s_port_lock) xSemaphoreGive(s_port_lock); }
+
 esp_err_t port_begin(uint32_t sample_rate)
 {
     if (s_port.rate != 0) {
@@ -53,6 +69,9 @@ esp_err_t port_begin(uint32_t sample_rate)
         }
         return ESP_OK;
     }
+
+    s_port_lock = xSemaphoreCreateMutex();
+    if (s_port_lock == nullptr) return ESP_ERR_NO_MEM;
 
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     esp_err_t err = i2s_new_channel(&chan_cfg, &s_port.tx, &s_port.rx);
@@ -180,7 +199,9 @@ esp_err_t MicInput::start()
     fs.sample_rate     = sample_rate_;
 
     const int64_t t0 = esp_timer_get_time();
-    int           rc = esp_codec_dev_open(codec_, &fs);
+    port_sperren();
+    int rc = esp_codec_dev_open(codec_, &fs);
+    port_freigeben();
     if (rc != 0) {
         ESP_LOGE(TAG, "esp_codec_dev_open: %d", rc);
         return ESP_FAIL;
@@ -201,7 +222,9 @@ void MicInput::stop()
 {
     if (codec_ == nullptr || !running_) return;
 
+    port_sperren();
     esp_codec_dev_close(codec_);
+    port_freigeben();
     running_ = false;
     ESP_LOGI(TAG, "Mikrofon aus (Spitze links %d, rechts %d).",
              (int)peak_l_, (int)peak_r_);
@@ -306,7 +329,9 @@ esp_err_t SpeakerOutput::start()
     // Das Oeffnen schaltet ueber pa_pin auch den Verstaerker ein. Er bleibt
     // deshalb nur so lange an, wie tatsaechlich etwas abgespielt wird — ein
     // Verstaerker ohne Signal rauscht hoerbar.
+    port_sperren();
     const int rc = esp_codec_dev_open(codec_, &fs);
+    port_freigeben();
     if (rc != 0) {
         ESP_LOGE(SPK, "esp_codec_dev_open: %d", rc);
         return ESP_FAIL;
@@ -322,7 +347,9 @@ void SpeakerOutput::stop()
 {
     if (codec_ == nullptr || !running_) return;
 
+    port_sperren();
     esp_codec_dev_close(codec_);
+    port_freigeben();
     running_ = false;
 }
 

@@ -33,6 +33,7 @@
 #include <freertos/semphr.h>
 
 #include "stt.h"
+#include "verbindung.h"
 
 class Chat {
   public:
@@ -60,14 +61,40 @@ class Chat {
     void copy_frage(char *out, size_t n) const;
     void copy_antwort(char *out, size_t n) const;
 
-    // Zaehlt jede fertige Antwort hoch — der Anknuepfungspunkt fuer die
-    // Sprachausgabe, genau wie Stt::final_seq() es fuer diese Klasse ist.
+    // Zaehlt jede fertige Antwort hoch. Fuer die Anzeige: sie haelt das Bild
+    // noch eine Weile stehen, nachdem alles gesagt ist.
     uint32_t antwort_seq() const { return (uint32_t)antwort_seq_; }
+
+    // --- Anknuepfung fuer die Stimme -------------------------------------
+    //
+    // Die Sprachausgabe wartete frueher auf die vollstaendige Antwort und
+    // verschenkte damit die zwei Sekunden, in denen der Text schon entsteht.
+    // Jetzt bekommt sie die Antwort in Portionen: alles, was an ganzen
+    // Saetzen feststeht, darf sofort gesprochen werden, der Rest waechst
+    // waehrenddessen nach.
+    //
+    // Zaehlt jede gestellte Frage. Wechselt er, faengt eine neue Antwort an
+    // und alles Bisherige ist hinfaellig.
+    uint32_t runde_seq() const { return (uint32_t)runde_seq_; }
+
+    // True, solange an dieser Antwort noch geschrieben wird.
+    bool runde_laeuft() const
+    {
+        const int32_t p = phase_;
+        return p == (int32_t)Phase::Fragt || p == (int32_t)Phase::Antwortet;
+    }
+
+    // Wie viele Zeichen der laufenden Antwort als ganze Saetze feststehen.
+    size_t fertig_bis() const;
+
+    // Die Zeichen [von, bis) der laufenden Antwort.
+    void ausschnitt(size_t von, size_t bis, char *out, size_t n) const;
 
     // Wie lange die letzte Runde vom Absenden bis zum letzten Stueck
     // gebraucht hat. Steht auf dem Display, weil Wartezeit die Groesse ist,
     // an der sich diese Kette messen lassen muss.
     int32_t last_ms() const { return last_ms_; }
+    int32_t satz1_ms() const { return satz1_ms_; }
 
   private:
     static void task_trampolin(void *self);
@@ -84,23 +111,45 @@ class Chat {
     // Frage im Zusammenhang steht ("und wie lange dauert das?"). Mehr als
     // drei Wechsel braucht ein Geraet mit einer Sprechtaste nicht, und jeder
     // weitere kostet bei jeder Anfrage erneut.
-    static const int kVerlauf = 3;
+    // Sechs Wechsel statt drei. Das Geraet hat eine Sprechtaste und keinen
+    // Faden, den man sehen koennte — wer nachfragt, bezieht sich fast immer
+    // auf das Vorige, und drei Wechsel waren bei einem laengeren Gespraech
+    // schnell aufgebraucht. Jeder Wechsel kostet bei jeder Anfrage erneut,
+    // aber 640 Zeichen sind gegen den Systemhinweis wenig.
+    static const int kVerlauf = 6;
     void verlauf_anfuegen(const char *frage, const char *antwort);
+
+    // Satzgrenzen der laufenden Antwort nachfuehren. Laeuft unter lock_.
+    void grenzen_nachfuehren(bool schluss);
+
+    // Ein Satzende, das kuerzer ist als das, ist keins — sonst zerfiele
+    // "z. B." in zwei Portionen und jede kostete eine eigene Anfrage.
+    static const size_t kMinSatz = 16;
 
     Stt *quelle_ = nullptr;
 
     const char *key_   = nullptr;
     const char *model_ = nullptr;
 
+    // Vorwaerm-Adresse: derselbe Host, aber eine Anfrage, die nichts kostet.
+    char waerm_[128] = {0};
+
     volatile int32_t phase_       = 0;   // Phase
     volatile int32_t antwort_seq_ = 0;
+    volatile int32_t runde_seq_   = 0;
     volatile int32_t last_ms_     = 0;
+
+    // Zeit bis zum ersten Satz, nicht bis zur vollstaendigen Antwort — das
+    // ist der Augenblick, ab dem die Stimme loslegen kann.
+    volatile int32_t satz1_ms_    = 0;
+    volatile int64_t runde_us_    = 0;
 
     uint32_t gesehen_ = 0;   // zuletzt verarbeitete Stt::final_seq()
 
     char              frage_[kMaxFrage]     = {0};
     char              antwort_[kMaxAntwort] = {0};
     size_t            antwort_len_          = 0;
+    size_t            fertig_bis_           = 0;
     SemaphoreHandle_t lock_                 = nullptr;
 
     char hist_frage_[kVerlauf][256]   = {};
@@ -116,4 +165,6 @@ class Chat {
     char  *zeile_   = nullptr;
     size_t zeile_n_ = 0;
     bool   sse_done_ = false;
+
+    Verbindung weg_;
 };
