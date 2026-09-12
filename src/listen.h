@@ -35,7 +35,25 @@ class Listener {
     // Knacks im Mitschnitt steht — und als Spitzenwert am Vollausschlag, was
     // jede Messung darueber unbrauchbar macht. Gesprochen wird in dieser
     // Zeit ohnehin nicht, die Taste ist gerade erst heruntergegangen.
-    static const int32_t kSkipMs = 120;
+    // Gemessen, Spitze je 20-ms-Block direkt nach dem Einschalten des
+    // Mikrofons:
+    //
+    //   aus der Ruhe       44    88   2360    263    210    814
+    //   nach Wiedergabe  30432 32767  16851  13575   5920   2885
+    //
+    // Der "Einschwinger" ist also keine Eigenschaft des ES7210, sondern das
+    // Nachklingen des Lautsprechers im Mikrofon — er entsteht nur, wenn die
+    // Taste eine laufende Antwort unterbricht. Aus der Ruhe heraus gibt es
+    // nichts abzuschneiden, und die 120 ms, die frueher pauschal wegfielen,
+    // waren das erste Wort.
+    //
+    // Nach einer Wiedergabe wird deshalb geschnitten, solange der Nachklang
+    // anliegt: mindestens kSkipMinMs, hoechstens kSkipMs, dazwischen bis die
+    // Blockspitze auf ein Achtel der ersten gefallen ist. 120 ms waren dafuer
+    // auch zu wenig — bei 2885 gegen 4347 Spitze im Nutzsignal lag der Rest
+    // noch in derselben Groessenordnung wie die Sprache.
+    static const int32_t kSkipMs    = 240;
+    static const int32_t kSkipMinMs = 60;
 
     // Fensterbreite fuer die Schaetzung des Grundrauschens. Der leiseste
     // Abschnitt einer Aufnahme ist eine Sprechpause, und dessen Effektivwert
@@ -65,6 +83,11 @@ class Listener {
     // PCM aus dem Aufnahmetask. Schreibt nur mit, solange zugehoert wird.
     void feed(const int16_t *pcm, size_t frames);
 
+    // Meldet, dass diese Aufnahme eine Wiedergabe unterbrochen hat und der
+    // Lautsprecher deshalb noch nachklingt. Muss vor dem ersten feed()
+    // kommen; ohne den Aufruf wird vorne nichts abgeschnitten.
+    void nachklang_erwarten();
+
     bool listening() const { return listening_ != 0; }
 
     // Dauer der laufenden Aufnahme; 0, wenn gerade nicht zugehoert wird.
@@ -92,8 +115,18 @@ class Listener {
     size_t   capacity_ = 0;      // Frames
     uint32_t rate_     = 16000;
 
-    size_t  fill_ = 0;           // nur im Aufnahmetask angefasst
-    size_t  skip_ = 0;           // noch zu verwerfende Frames
+    size_t  fill_     = 0;       // nur im Aufnahmetask angefasst
+    size_t  skip_     = 0;       // hoechstens noch zu verwerfende Frames
+    size_t  skip_min_ = 0;       // davon in jedem Fall zu verwerfende
+    int32_t nachklang_ = 0;      // Spitze des ersten verworfenen Blocks
+
+    // Spitzenwerte der verworfenen Bloecke, je 20 ms. Damit steht im Log,
+    // wie lange der Einschwinger des ES7210 tatsaechlich anliegt — kSkipMs
+    // war bisher geschaetzt, und jede Millisekunde davon fehlt vorne am
+    // gesprochenen Wort.
+    static const int kEinschwingBloecke = 8;
+    int32_t einschwing_[kEinschwingBloecke] = {0};
+    int     einschwing_n_ = 0;
 
     // Alle Kennzahlen entstehen in einem Durchgang in stop(), nicht mitlaufend
     // in feed(). Erst dort steht fest, wo die Aufnahme endet — und ohne dieses

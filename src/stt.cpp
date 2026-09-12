@@ -278,6 +278,16 @@ esp_err_t Stt::open_session()
     cfg.crt_bundle_attach       = esp_crt_bundle_attach;
     cfg.buffer_size             = 4096;
     cfg.task_stack              = 6144;
+
+    // Ohne diese Zeile legt esp_websocket_client seinen Task auf Prioritaet 5
+    // — ueber den Spieler (4) und ueber alles andere, was hier mit dem Netz
+    // redet (3). Waehrend seines TLS-Handschlags ist das eine Sekunde
+    // Rechenarbeit, die niemand unterbricht, und er teilt sich mit Mikrofon
+    // und Lautsprecher den I2C-Bus. Dessen Sperre ist in der IDF ein
+    // Binaersemaphor ohne Prioritaetsvererbung: wer sie haelt und verdraengt
+    // wird, haelt sie weiter. So brauchte das Aufwachen des ES7210 statt 50 ms
+    // ploetzlich 766, und die ersten drei Silben fehlten.
+    cfg.task_prio               = 3;
     cfg.disable_auto_reconnect  = true;
     cfg.network_timeout_ms      = 10000;
     cfg.reconnect_timeout_ms    = 5000;

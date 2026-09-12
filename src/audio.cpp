@@ -198,8 +198,13 @@ esp_err_t MicInput::start()
     fs.channel_mask    = 0;         // 0 = alle Kanaele
     fs.sample_rate     = sample_rate_;
 
+    // Zwei Zeiten, nicht eine: 765 ms Aufwachzeit sind schon gemessen worden,
+    // und aus einer einzigen Zahl ist nicht zu sehen, ob der Lautsprecher den
+    // Port noch nicht hergegeben hat oder ob der Wandler selbst so lange
+    // braucht. Die Schranke steht vor dem Sperren, die zweite dahinter.
     const int64_t t0 = esp_timer_get_time();
     port_sperren();
+    const int64_t t1 = esp_timer_get_time();
     int rc = esp_codec_dev_open(codec_, &fs);
     port_freigeben();
     if (rc != 0) {
@@ -213,8 +218,9 @@ esp_err_t MicInput::start()
     peak_l_  = 0;
     peak_r_  = 0;
 
-    ESP_LOGI(TAG, "Mikrofon an (%d ms, %.1f dB).",
-             (int)((esp_timer_get_time() - t0) / 1000), gain_db_);
+    ESP_LOGI(TAG, "Mikrofon an (%d ms Port frei, %d ms oeffnen, %.1f dB).",
+             (int)((t1 - t0) / 1000),
+             (int)((esp_timer_get_time() - t1) / 1000), gain_db_);
     return ESP_OK;
 }
 
@@ -347,10 +353,17 @@ void SpeakerOutput::stop()
 {
     if (codec_ == nullptr || !running_) return;
 
+    // Solange hier gezaehlt wird, wartet das Mikrofon: beide haengen an
+    // derselben Sperre, und wer die Taste drueckt, waehrend die Antwort
+    // ausklingt, verliert genau diese Zeit vorne an seiner Frage.
+    const int64_t t0 = esp_timer_get_time();
     port_sperren();
     esp_codec_dev_close(codec_);
     port_freigeben();
     running_ = false;
+
+    const int ms = (int)((esp_timer_get_time() - t0) / 1000);
+    if (ms > 20) ESP_LOGW(TAG, "Lautsprecher zu: %d ms.", ms);
 }
 
 esp_err_t SpeakerOutput::write_mono(const int16_t *pcm, size_t frames)

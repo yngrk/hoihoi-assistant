@@ -1,6 +1,7 @@
 #include "listen.h"
 
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
 
 #include <esp_heap_caps.h>
@@ -42,14 +43,23 @@ int32_t Listener::elapsed_ms() const
 
 void Listener::start()
 {
-    fill_        = 0;
-    live_frames_ = 0;
-    skip_        = (size_t)rate_ * kSkipMs / 1000;
+    fill_         = 0;
+    live_frames_  = 0;
+    einschwing_n_ = 0;
+    nachklang_    = 0;
+    skip_         = 0;   // nur nachklang_erwarten() schneidet vorne etwas ab
+    skip_min_     = 0;
     started_ms_  = now_ms();
     last_frames_ = 0;
     listening_   = 1;
 
     ESP_LOGI(TAG, "Zuhoeren gestartet.");
+}
+
+void Listener::nachklang_erwarten()
+{
+    skip_     = (size_t)rate_ * kSkipMs / 1000;
+    skip_min_ = (size_t)rate_ * kSkipMinMs / 1000;
 }
 
 void Listener::stop(const char *grund)
@@ -155,12 +165,42 @@ void Listener::feed(const int16_t *pcm, size_t frames)
 {
     if (listening_ == 0 || buf_ == nullptr) return;
 
-    // Den Einschwinger des Wandlers vorne abschneiden, siehe kSkipMs.
+    // Den Nachklang des Lautsprechers vorne abschneiden, siehe kSkipMs.
     if (skip_ > 0) {
         const size_t weg = (skip_ < frames) ? skip_ : frames;
-        skip_  -= weg;
-        pcm    += weg;
-        frames -= weg;
+
+        int32_t spitze = 0;
+        for (size_t i = 0; i < weg; i++) {
+            const int32_t a = (pcm[i] < 0) ? -(int32_t)pcm[i] : (int32_t)pcm[i];
+            if (a > spitze) spitze = a;
+        }
+        if (nachklang_ == 0) nachklang_ = spitze;
+        if (einschwing_n_ < kEinschwingBloecke) einschwing_[einschwing_n_++] = spitze;
+
+        // Abgeklungen heisst: ein Achtel der ersten Spitze, also 18 dB
+        // darunter. Die Mindestmenge geht in jedem Fall weg, denn die ersten
+        // Bloecke koennen zufaellig leise sein.
+        const bool weiter = (skip_min_ > 0) || (spitze * 8 > nachklang_);
+
+        if (weiter) {
+            skip_     -= weg;
+            skip_min_  = (skip_min_ > weg) ? (skip_min_ - weg) : 0;
+            pcm       += weg;
+            frames    -= weg;
+        } else {
+            skip_ = 0;
+        }
+
+        if (skip_ == 0 && einschwing_n_ > 0) {
+            char zeile[96];
+            int  n = 0;
+            for (int i = 0; i < einschwing_n_ && n < (int)sizeof(zeile) - 8; i++) {
+                n += snprintf(&zeile[n], sizeof(zeile) - n, "%s%d",
+                              i ? " " : "", (int)einschwing_[i]);
+            }
+            ESP_LOGI(TAG, "Nachklang je 20 ms: %s", zeile);
+        }
+
         if (frames == 0) return;
     }
 

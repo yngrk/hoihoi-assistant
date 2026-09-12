@@ -252,20 +252,39 @@ Prellimpuls während des Haltens schnitte sonst mitten im Wort ab.
 
 ### Was vorne und hinten abgeschnitten wird
 
-Von jeder Aufnahme fallen die ersten 120 und die letzten 60 ms weg. Das ist
-kein Sicherheitsabstand, sondern die Antwort auf zwei gemessene Störungen:
-das Einschalten des ES7210 setzt einen Einschwinger ab, und das Loslassen der
-Taste knackt.
+Hinten fallen von jeder Aufnahme 60 ms weg, vorne nur manchmal. Beides ist kein
+Sicherheitsabstand, sondern die Antwort auf gemessene Störungen — und die vorne
+war lange falsch verstanden.
 
-Beide waren **lauter als jedes gesprochene Wort**. Vor dem Schnitt lag die
-Spitze jeder Aufnahme bei rund 14000 Zählern, danach bei 2700 bis 4200 — die
-Artefakte übertrafen das Nutzsignal um 12 bis 14 dB. Sie gingen bis dahin
-unbesehen in die Transkription.
+Das Loslassen der Taste knackt, und der Knacks ist **lauter als jedes
+gesprochene Wort**: vor dem Schnitt lag die Spitze einer Aufnahme bei rund
+14000 Zählern, danach bei 2700 bis 4200. Gesprochen wird dort ohnehin nicht,
+die Taste geht gerade hoch. Wer bis zum letzten Moment durchspricht, verliert
+die letzte Silbe — dann ist `kTailMs` in [src/listen.h](src/listen.h) die
+Stellschraube.
 
-Gesprochen wird in diesen Abschnitten ohnehin nicht: vorne ist die Taste gerade
-erst heruntergegangen, hinten geht sie gerade hoch. Wer bis zum letzten Moment
-durchspricht, verliert die letzte Silbe — dann ist `kTailMs` in
-[src/listen.h](src/listen.h) die Stellschraube.
+Vorne fielen anfangs pauschal 120 ms weg, mit derselben Begründung: der ES7210
+setze beim Einschalten einen Einschwinger ab. Die Spitzenwerte der ersten
+Blöcke, je 20 ms, sagen etwas anderes:
+
+```
+aus der Ruhe       44    88   2360    263    210    814
+nach Wiedergabe  30432 32767  16851  13575   5920   2885
+```
+
+Der „Einschwinger" ist keine Eigenschaft des Wandlers, sondern der
+Lautsprecher, der ins Mikrofon nachklingt. Er entsteht nur, wenn die Taste eine
+laufende Antwort unterbricht. Aus der Ruhe heraus gibt es nichts abzuschneiden
+— die 120 ms waren dort das erste Wort. Und im anderen Fall waren sie zu wenig:
+bei 2885 gegen 4347 Spitze im Nutzsignal lag der Rest noch in derselben
+Größenordnung wie die Sprache.
+
+Geschnitten wird deshalb nur nach einer Unterbrechung, und dann nicht nach Uhr,
+sondern nach Pegel: mindestens 60, höchstens 240 ms, dazwischen so lange, bis
+die Blockspitze auf ein Achtel der ersten gefallen ist. Der Aufnahmetask meldet
+den Fall über `Listener::nachklang_erwarten()` an; ohne diesen Aufruf bleibt
+vorne alles stehen. Aus 240 ms Ton bei 1517 ms Tastendruck wurden so 1360 ms
+bei 1439 ms.
 
 ### Was am Ende gemessen wird
 
@@ -655,10 +674,19 @@ der seriellen Schnittstelle stehen sie weiter.
 - **Stockende Anzeige beim ersten Handschlag**: laufen Erkennung, Chat und
   Stimme gleichzeitig durch ihren TLS-Aufbau, fällt die Bildrate für rund eine
   Sekunde auf 15/s, einzelne Bilder brauchen über eine Sekunde. Die Aufnahme
-  ist davon nicht mehr betroffen, die Anzeige schon. Der Anzeigetask läuft auf
-  Kern 1, die Handschläge auf Kern 0 — die Kopplung dürfte über die
+  ist davon wieder betroffen, siehe den nächsten Punkt. Der Anzeigetask läuft
+  auf Kern 1, die Handschläge auf Kern 0 — die Kopplung dürfte über die
   Heap-Sperre laufen, die mbedTLS mit `CONFIG_MBEDTLS_DYNAMIC_BUFFER` stark
   belastet. Nicht nachgemessen.
+- **Ton, der während des Handschlags verlorengeht**: jede Aufnahme verliert
+  300 bis 900 ms, und zwar am Anfang, während die Erkennung ihre Verbindung
+  aufbaut. Gemessen an drei Runden: 2069 ms gedrückt, 1160 ms aufgezeichnet;
+  1252 gegen 940; 1715 gegen 1380. Die Lücke der ersten Runde deckt sich mit
+  zwei gemeldeten Staus von 607 und 345 ms. Der Aufnahmetask liegt auf
+  Priorität 6 über allem, was diese Firmware selbst anlegt, und steht trotzdem
+  — ob er auf Daten wartet oder nur nicht drankommt, misst gerade der
+  Wachtask. Praktisch heißt das: wer sofort nach dem Tastendruck spricht,
+  verliert den Satzanfang; wer eine Sekunde wartet, nicht.
 - **Erkennungssitzung vorwärmen**: der WebSocket wird bei jedem Tastendruck
   neu aufgebaut und kostet 1,9 s — die größte verbliebene Einzelzeit. Chat und
   Stimme halten ihre Verbindung stehen; für die Erkennung wäre dasselbe

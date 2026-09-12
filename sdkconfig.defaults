@@ -47,3 +47,10 @@ CONFIG_BT_BLUEDROID_ENABLED=n
 # Mit dieser Zeile hoelt mbedTLS die Puffer beim Senden und Empfangen und
 # gibt sie danach wieder her.
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+
+# Laufzeitstatistik je Task. Gebraucht fuer den Stau-Melder in main.cpp: der
+# Aufnahmetask auf Kern 1 stand mehrfach ueber eine Sekunde still, obwohl er
+# mit Prioritaet 6 ueber allem liegt, was diese Firmware selbst anlegt. Wer
+# ihn verdraengt, steht nur hier drin.
+CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y

@@ -271,6 +271,7 @@ void Chat::sse_line(const char *line)
     if (cJSON_IsString(ct) && ct->valuestring != nullptr) {
         if (phase_ == (int32_t)Phase::Fragt) phase_ = (int32_t)Phase::Antwortet;
         append_antwort(ct->valuestring);
+        snprintf(letztes_, sizeof(letztes_), "%s", ct->valuestring);
     }
 
     cJSON_Delete(root);
@@ -283,6 +284,7 @@ void Chat::frage_stellen(const char *frage)
     set_frage(frage);
     phase_     = (int32_t)Phase::Fragt;
     sse_done_  = false;
+    letztes_[0] = '\0';
     zeile_n_   = 0;
     satz1_ms_  = 0;
 
@@ -379,6 +381,17 @@ void Chat::frage_stellen(const char *frage)
         ESP_LOGI(TAG, "Antwort nach %d ms (erster Satz nach %d ms, %d Wechsel "
                       "Verlauf): %s",
                  (int)last_ms_, (int)satz1_ms_, hist_n_, antwort);
+
+        // Endet die Antwort nicht auf einem Satzzeichen, haengt hinten ein
+        // Bruchstueck. Mit dem letzten Teilstueck daneben laesst sich sehen,
+        // ob es als eigenes delta.content kam.
+        const size_t al = strlen(antwort);
+        const char   e  = (al > 0) ? antwort[al - 1] : '.';
+        if (e != '.' && e != '!' && e != '?' && e != ':') {
+            ESP_LOGW(TAG, "Antwort endet ohne Satzzeichen, letztes "
+                          "Teilstueck war \"%s\".", letztes_);
+        }
+
         verlauf_anfuegen(frage, antwort);
     } else {
         phase_ = (int32_t)Phase::Fehler;

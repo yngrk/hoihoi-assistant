@@ -150,6 +150,14 @@ class Chat {
     char              antwort_[kMaxAntwort] = {0};
     size_t            antwort_len_          = 0;
     size_t            fertig_bis_           = 0;
+
+    // Das zuletzt empfangene Teilstueck des Ereignisstroms. Manche Antworten
+    // enden mit einem angehaengten Wort ohne Bezug ("... um die Sonne.
+    // geschniegelt"). Der Zusammenbau hier kann es nicht erzeugen — er
+    // schreibt nur, was in delta.content steht —, also muss es vom Dienst
+    // kommen. Damit das nachweisbar ist und nicht nur auffaellt, steht das
+    // letzte Teilstueck im Log, sobald eine Antwort ohne Satzzeichen endet.
+    char letztes_[48] = {0};
     SemaphoreHandle_t lock_                 = nullptr;
 
     char hist_frage_[kVerlauf][256]   = {};

@@ -1028,6 +1028,92 @@ static void stats_task(void *)
 
 
 static void audio_task(void *);
+static TaskHandle_t s_audio_task = nullptr;
+
+// Der Aufnahmetask liegt auf Prioritaet 6 ueber allem, was diese Firmware
+// selbst anlegt, und steht trotzdem. Zwei Erklaerungen sind moeglich, und sie
+// fuehren zu entgegengesetzten Antworten: entweder er wartet auf Daten, die
+// der Wandler nicht liefert, oder er ist laengst bereit und kommt nur nicht
+// dran. Sich selbst beim Warten zusehen kann er nicht — also sieht ihm von
+// Kern 0 aus ein zweiter zu, der waehrenddessen nachweislich laeuft.
+static void wacht_task(void *)
+{
+    int bereit = 0, blockiert = 0;
+    while (true) {
+        const eTaskState z = (s_audio_task != nullptr)
+                                 ? eTaskGetState(s_audio_task) : eRunning;
+
+        if (z == eReady) {
+            bereit++;
+        } else {
+            if (bereit >= 12) {
+                ESP_LOGW(TAG, "Aufnahme bereit, aber nicht dran: %d ms.",
+                         bereit * 5);
+            }
+            bereit = 0;
+        }
+
+        if (z == eBlocked) {
+            blockiert++;
+        } else {
+            if (blockiert >= 12) {
+                ESP_LOGW(TAG, "Aufnahme wartet auf Ton: %d ms.", blockiert * 5);
+            }
+            blockiert = 0;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+}
+
+// --- Stau-Melder ----------------------------------------------------------
+//
+// Zweimal gemessen und beide Male unerklaert: der Aufnahmetask auf Kern 1
+// steht waehrend des Verbindungsaufbaus der Erkennung ueber eine Sekunde
+// still, obwohl er mit Prioritaet 6 ueber allem liegt, was diese Firmware
+// selbst anlegt — und der Anzeigetask daneben ebenso. Aus dem Log allein ist
+// nicht zu sehen, wer ihn verdraengt; aus der Laufzeitstatistik von FreeRTOS
+// schon. Bei jedem Durchgang eine Momentaufnahme, und wenn zwischen zwei
+// Durchgaengen eine Luecke klafft, die Differenz dazu.
+static const int    kStauTasks = 24;
+static TaskStatus_t s_stau_vorher[kStauTasks];
+static UBaseType_t  s_stau_n = 0;
+
+static void stau_schnappschuss(void)
+{
+    uint32_t gesamt = 0;
+    s_stau_n = uxTaskGetSystemState(s_stau_vorher, kStauTasks, &gesamt);
+}
+
+static void stau_melden(int luecke_ms, int vor_ms, int lesen_ms, int nach_ms)
+{
+    static TaskStatus_t jetzt[kStauTasks];
+
+    uint32_t          gesamt = 0;
+    const UBaseType_t n      = uxTaskGetSystemState(jetzt, kStauTasks, &gesamt);
+
+    char zeile[220];
+    int  p = 0;
+    for (UBaseType_t i = 0; i < n && p < (int)sizeof(zeile) - 28; i++) {
+        uint32_t vorher = 0;
+        bool     kannte = false;
+        for (UBaseType_t k = 0; k < s_stau_n; k++) {
+            if (s_stau_vorher[k].xHandle == jetzt[i].xHandle) {
+                vorher = s_stau_vorher[k].ulRunTimeCounter;
+                kannte = true;
+                break;
+            }
+        }
+        if (!kannte) continue;
+
+        const int32_t delta = (int32_t)(jetzt[i].ulRunTimeCounter - vorher) / 1000;
+        if (delta < 20) continue;
+        p += snprintf(&zeile[p], sizeof(zeile) - p, " %s=%d",
+                      jetzt[i].pcTaskName, (int)delta);
+    }
+    ESP_LOGW(TAG, "Stau %d ms (davor %d, lesen %d, danach %d):%s",
+             luecke_ms, vor_ms, lesen_ms, nach_ms, zeile);
+}
 
 // Richtet alles ein, was zum Aufnehmen, Erkennen, Antworten und Sprechen
 // gehoert, und uebergibt den Takt danach an audio_task(). true heisst: es
@@ -1096,8 +1182,14 @@ static bool visualize_mic(void)
     // verdraengt und umgekehrt.
     xTaskCreatePinnedToCore(display_task, "display", 4096, nullptr, 4, nullptr, 1);
 
-    // Niedrige Prioritaet: die Sensorwerte duerfen warten, Bild und Ton nicht.
-    xTaskCreatePinnedToCore(stats_task, "stats", 3072, nullptr, 2, nullptr, 0);
+    // Hohe Prioritaet, obwohl die Sensorwerte warten koennten: dieser Task
+    // fasst den I2C-Bus an, und den teilt er sich mit Mikrofon und
+    // Lautsprecher. Die Bussperre der IDF vererbt keine Prioritaet — ein
+    // Sensortask, der mitten in einer Uebertragung verdraengt wird, laesst
+    // das Mikrofon so lange warten, wie er selbst wartet. Gerechnet wird hier
+    // nichts; die zwanzig Millisekunden einer Messung sind vTaskDelay.
+    xTaskCreatePinnedToCore(stats_task, "stats", 3072, nullptr, 6, nullptr, 0);
+    xTaskCreatePinnedToCore(wacht_task, "wacht", 3072, nullptr, 7, nullptr, 0);
 
     // Der Lautsprecher bleibt, die Wiedergabe der eigenen Aufnahme nicht.
     // Sie war ein Diagnosemittel fuer die Aufnahmequalitaet, und die ist
@@ -1139,8 +1231,8 @@ static bool visualize_mic(void)
     // muessen. Kern 1 hat ausser der Anzeige nichts zu tun, und dort steht
     // der Aufnahmetakt ueber ihr: ein ausgelassenes Bild faellt nicht auf,
     // eine verlorene Silbe schon.
-    if (xTaskCreatePinnedToCore(audio_task, "audio", 4096, nullptr, 6, nullptr, 1)
-            != pdPASS) {
+    if (xTaskCreatePinnedToCore(audio_task, "audio", 4096, nullptr, 6,
+                                &s_audio_task, 1) != pdPASS) {
         ESP_LOGE(TAG, "  Aufnahmetask konnte nicht angelegt werden.");
         return false;
     }
@@ -1161,6 +1253,8 @@ static void audio_task(void *)
     int32_t rms = 0;
 
     while (true) {
+        const int64_t t_a = esp_timer_get_time();
+
         // Die Taste zuerst, unabhaengig vom Mikrofon: solange nicht
         // aufgenommen wird, gibt es keinen Audioblock, an dem sich die
         // Abfrage aufhaengen koennte. Der 20-ms-Takt bleibt derselbe, und
@@ -1178,9 +1272,10 @@ static void audio_task(void *)
             // haengen an derselben Datenschnittstelle, und wer sie im selben
             // Augenblick oeffnet und schliesst, bekommt eine Aufnahme mit
             // null Frames — die Nachfrage ginge verloren.
-            const int64_t t_taste = esp_timer_get_time();
-            int           runden  = 0;
-            if (tts.spricht()) {
+            const int64_t t_taste   = esp_timer_get_time();
+            int           runden    = 0;
+            const bool    war_stimme = tts.spricht();
+            if (war_stimme) {
                 tts.abbrechen();
                 for (; runden < 100 && tts.spricht(); runden++) {
                     vTaskDelay(pdMS_TO_TICKS(5));
@@ -1188,6 +1283,11 @@ static void audio_task(void *)
             }
             const int wartems = (int)((esp_timer_get_time() - t_taste) / 1000);
             mic.start();
+
+            // Nur wenn der Lautsprecher gerade noch lief, klingt er ins
+            // Mikrofon nach. Sonst ist der Wandler vom ersten Block an sauber,
+            // und jede abgeschnittene Millisekunde fehlt am ersten Wort.
+            if (war_stimme) listener.nachklang_erwarten();
 
             // Die Uebergabe kostet Aufnahmezeit: bis das Mikrofon steht,
             // faellt alles Gesprochene weg. Zwei Zahlen, weil sie zwei
@@ -1217,12 +1317,18 @@ static void audio_task(void *)
             window_pk = 0;
         }
 
+        const int64_t t_b = esp_timer_get_time();
+        int64_t       t_c = t_b;
+
         if (!mic.running()) {
             vTaskDelay(pdMS_TO_TICKS(20));
+            t_c = esp_timer_get_time();
         } else if (mic.read_mono(block, kReadFrames) != ESP_OK) {
             ESP_LOGW(TAG, "  Lesefehler, naechster Versuch.");
             vTaskDelay(pdMS_TO_TICKS(20));
+            t_c = esp_timer_get_time();
         } else {
+            t_c = esp_timer_get_time();
             listener.feed(block, kReadFrames);
 
             int16_t lo[kColumnsPerRead];
@@ -1265,6 +1371,20 @@ static void audio_task(void *)
             shared_rms  = rms;
             shared_peak = window_pk;
             xSemaphoreGive(scope_lock);
+        }
+
+        // Wer diesen Task verdraengt hat, waehrend er nicht lief.
+        {
+            static int64_t letzte_runde = 0;
+            const int64_t  jetzt_us     = esp_timer_get_time();
+            if (letzte_runde != 0 && jetzt_us - letzte_runde > 150000) {
+                stau_melden((int)((jetzt_us - letzte_runde) / 1000),
+                            (int)((t_b - t_a) / 1000),
+                            (int)((t_c - t_b) / 1000),
+                            (int)((jetzt_us - t_c) / 1000));
+            }
+            letzte_runde = jetzt_us;
+            stau_schnappschuss();
         }
 
         // Einmal pro Sekunde eine Zeile ins Log, mit Tasten und Batterie.
