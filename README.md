@@ -66,6 +66,8 @@ PlatformIO selbst.
 src/main.cpp              Bring-up-Ablauf
 src/user_config.h         Pinbelegung
 src/gfx.h, src/gfx.cpp    Clippende Zeichenschicht über dem Treiber
+src/audio.h, src/audio.cpp  Mikrofoneingang: ES7210 über I²C, Daten über I²S
+src/idf_component.yml     Abhängigkeit auf espressif/esp_codec_dev
 components/port_bsp/      ST7305-Treiber, unverändert von Waveshare übernommen
 sdkconfig.defaults        Flash-, PSRAM- und Konsolenkonfiguration
 partitions.csv            8 MB App-Partition
@@ -100,7 +102,29 @@ zum Upstream und die Absicherung ist trotzdem lückenlos. **Nicht direkt
    Orientierung: die anderen Elemente sind symmetrisch und würden eine
    Spiegelung nicht verraten. Danach elf Zeichenaufrufe mit Koordinaten
    außerhalb der Fläche als Selbsttest der Bereichsprüfung.
-5. **Tasten und Batterie** — Dauerschleife, alle zwei Sekunden ein Log.
+5. **Tasten und Batterie** — Zustand beider Tasten und Batterie-Rohwert.
+6. **Mikrofon** — läuft anschließend dauerhaft, siehe unten.
+
+## Mikrofon-Visualisierung
+
+Die beiden Onboard-Mikrofone hängen am ES7210, einem reinen ADC. Der ESP32-S3
+ist I²S-Master und gibt Takt und Wortsynchronisation vor, der ES7210 läuft als
+Slave — MCLK muss deshalb bespielt werden, sonst arbeitet der Wandler ohne
+Referenz. Die Registerprogrammierung übernimmt Espressifs `esp_codec_dev`; das
+ist deutlich verlässlicher, als die Werte selbst herzuleiten.
+
+16 kHz, 16 Bit, beide Kanäle zu Mono gemittelt. 40 Frames je Bildspalte mal 400
+Spalten ergeben genau eine Sekunde Signal über die volle Breite; das Bild läuft
+nach links weg und wird alle 40 ms neu gezeichnet.
+
+Der Vollausschlag skaliert automatisch — sofort auf, langsam wieder zu, nie
+unter einen Sockelwert. Die Empfindlichkeit der Mikrofone ist nicht
+dokumentiert, ein fester Faktor würde also entweder in Stille das Grundrauschen
+aufblasen oder bei Sprache am Anschlag kleben.
+
+Auf der Hardware gemessen: Grundrauschen bei −63 dBFS, Raumgeräusch um
+−40 dBFS, laute Sprache −21 dBFS — über 40 dB nutzbarer Dynamikumfang. Ein
+Bildaufbau kostet 3–5 ms bei einem Budget von 40 ms.
 
 ## Offene Punkte
 
@@ -111,6 +135,9 @@ zum Upstream und die Absicherung ist trotzdem lückenlos. **Nicht direkt
 - **Batterie-ADC**: Das Teilerverhältnis am ADC ist nicht dokumentiert, deshalb
   wird bisher nur der Rohwert geloggt. Für eine Spannungsangabe muss der Faktor
   am Schaltplan oder empirisch bestimmt werden.
-- **Audio**: ES8311/ES7210 sind noch nicht initialisiert. Referenz dafür ist
-  Waveshares Beispiel `07_Audio_Test`.
+- **Keyword-Erkennung**: Der Mikrofonpfad steht, die eigentliche
+  Schlüsselworterkennung fehlt noch. Die Visualisierung ist der erste Schritt
+  dorthin und belegt, dass brauchbares Signal ankommt.
+- **Audioausgabe**: Der ES8311 ist noch nicht initialisiert, nur der ES7210 für
+  die Aufnahme. Referenz dafür ist Waveshares Beispiel `07_Audio_Test`.
 - **microSD und RTC**: noch nicht angebunden.

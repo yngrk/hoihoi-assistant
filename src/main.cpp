@@ -22,9 +22,12 @@
 #include <driver/gpio.h>
 #include <driver/i2c_master.h>
 #include <esp_adc/adc_oneshot.h>
+#include <esp_timer.h>
+#include <math.h>
 
 #include "display_bsp.h"
 #include "gfx.h"
+#include "audio.h"
 #include "user_config.h"
 
 static const char *TAG = "bringup";
@@ -280,6 +283,198 @@ static void init_inputs(void)
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, ADC_CHANNEL_3, &chan_cfg));
 }
 
+// --- 6. Mikrofon-Visualisierung -------------------------------------------
+
+static MicInput mic;
+
+// Aufteilung der Flaeche: oben das Wellenbild, unten ein Pegelbalken.
+static const int kScopeTop    = 2;
+static const int kScopeBottom = 247;
+static const int kScopeCenter = (kScopeTop + kScopeBottom) / 2;
+static const int kScopeHalf   = (kScopeBottom - kScopeTop) / 2;
+
+static const int kMeterTop    = 260;
+static const int kMeterBottom = 295;
+
+// 40 Frames je Spalte bei 16 kHz und 400 Spalten ergeben genau eine Sekunde
+// Signal ueber die volle Bildbreite.
+static const int kFramesPerColumn = 40;
+static const int kColumnsPerRead  = 8;
+static const int kReadFrames      = kFramesPerColumn * kColumnsPerRead;   // 320 = 20 ms
+static const int kReadsPerFrame   = 2;                                    // neu zeichnen alle 40 ms (25 Bilder/s)
+
+// Ringpuffer der Huellkurve, eine Spalte je Bildspalte.
+static int16_t col_min[LCD_WIDTH];
+static int16_t col_max[LCD_WIDTH];
+static int     col_head = 0;   // aelteste Spalte, also der linke Bildrand
+
+// Die Empfindlichkeit der Mikrofone ist nicht dokumentiert, ein fester Faktor
+// wuerde also entweder in Stille das Grundrauschen aufblasen oder bei Sprache
+// am Anschlag kleben. Stattdessen folgt der Vollausschlag dem Signal: sofort
+// auf, langsam wieder zu — und nie unter kScaleFloor, damit Stille still
+// aussieht.
+static const int32_t kScaleFloor = 1200;
+static int32_t       scope_scale = kScaleFloor;
+
+static int sample_to_y(int32_t s)
+{
+    return kScopeCenter - (int)((s * kScopeHalf) / scope_scale);
+}
+
+// Pegel logarithmisch: linear waere Sprache bei 16 Bit ein kaum sichtbarer
+// Stummel am linken Rand.
+static int level_to_width(int32_t amplitude)
+{
+    if (amplitude < 1) amplitude = 1;
+    float db = 20.0f * log10f((float)amplitude / 32768.0f);
+    if (db < -60.0f) db = -60.0f;
+    if (db > 0.0f)   db = 0.0f;
+    return (int)((db + 60.0f) / 60.0f * (LCD_WIDTH - 4));
+}
+
+static void draw_scope(int32_t rms, int32_t peak)
+{
+    display->clear(ColorWhite);
+
+    // Mittellinie gestrichelt, damit sie das Signal nicht verdeckt.
+    for (int x = 0; x < LCD_WIDTH; x += 8) {
+        display->hline(x, x + 3, kScopeCenter, ColorBlack);
+    }
+
+    // Aelteste Spalte links, neueste rechts — das Bild laeuft nach links weg.
+    for (int i = 0; i < LCD_WIDTH; i++) {
+        const int idx = (col_head + i) % LCD_WIDTH;
+        const int y0  = sample_to_y(col_max[idx]);
+        const int y1  = sample_to_y(col_min[idx]);
+        if (y0 == y1) {
+            display->pixel(i, y0, ColorBlack);
+        } else {
+            display->vline(i, y0, y1, ColorBlack);
+        }
+    }
+
+    display->rect(0, kMeterTop, LCD_WIDTH - 1, kMeterBottom, ColorBlack);
+    const int w = level_to_width(rms);
+    if (w > 0) {
+        display->fill_rect(2, kMeterTop + 3, 2 + w - 1, kMeterBottom - 3, ColorBlack);
+    }
+    // Spitzenwert als schmaler Strich, damit kurze Transienten sichtbar
+    // bleiben, die der Balken schon wieder verlassen hat.
+    const int p = level_to_width(peak);
+    if (p > 0) {
+        display->vline(2 + p - 1, kMeterTop + 1, kMeterBottom - 1, ColorBlack);
+    }
+
+    display->flush();
+}
+
+static void visualize_mic(void)
+{
+    ESP_LOGI(TAG, "--- Mikrofon-Visualisierung ---");
+
+    if (mic.begin(i2c_bus) != ESP_OK) {
+        ESP_LOGE(TAG, "  Mikrofon nicht verfuegbar, Visualisierung entfaellt.");
+        return;
+    }
+
+    static int16_t block[kReadFrames];
+    memset(col_min, 0, sizeof(col_min));
+    memset(col_max, 0, sizeof(col_max));
+
+    ESP_LOGI(TAG, "  %d Hz, %d Frames je Spalte, %d Spalten = %.1f s Bildbreite.",
+             (int)mic.sample_rate(), kFramesPerColumn, LCD_WIDTH,
+             (float)LCD_WIDTH * kFramesPerColumn / mic.sample_rate());
+
+    int     reads      = 0;
+    int64_t sum_sq     = 0;      // fuer den Effektivwert ueber eine Sekunde
+    int32_t sum_count  = 0;
+    int32_t window_pk  = 0;
+    int64_t last_log   = esp_timer_get_time();
+
+    // Zeichendauer mitmessen: bleibt sie ueber kReadsPerFrame * 20 ms, laeuft
+    // der I2S-Puffer ueber und das Bild bekommt Luecken in der Zeitachse.
+    int64_t draw_us_sum = 0;
+    int32_t draw_us_max = 0;
+    int32_t draw_count  = 0;
+
+    while (true) {
+        if (mic.read_mono(block, kReadFrames) != ESP_OK) {
+            ESP_LOGW(TAG, "  Lesefehler, naechster Versuch.");
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+
+        int32_t block_peak = 0;
+        for (int c = 0; c < kColumnsPerRead; c++) {
+            int16_t lo = INT16_MAX;
+            int16_t hi = INT16_MIN;
+            for (int k = 0; k < kFramesPerColumn; k++) {
+                const int16_t s = block[c * kFramesPerColumn + k];
+                if (s < lo) lo = s;
+                if (s > hi) hi = s;
+
+                const int32_t a = (s < 0) ? -(int32_t)s : (int32_t)s;
+                if (a > block_peak) block_peak = a;
+                if (a > window_pk)  window_pk  = a;
+                sum_sq += (int64_t)s * s;
+                sum_count++;
+            }
+            col_min[col_head] = lo;
+            col_max[col_head] = hi;
+            col_head = (col_head + 1) % LCD_WIDTH;
+        }
+
+        // Vollausschlag nachfuehren: sofort auf, langsam zu.
+        if (block_peak > scope_scale) {
+            scope_scale = block_peak;
+        } else {
+            scope_scale -= (scope_scale - kScaleFloor) / 24;
+        }
+        if (scope_scale < kScaleFloor) scope_scale = kScaleFloor;
+
+        if (++reads >= kReadsPerFrame) {
+            reads = 0;
+            const int32_t rms = (sum_count > 0)
+                                    ? (int32_t)sqrt((double)(sum_sq / sum_count))
+                                    : 0;
+            const int64_t t0 = esp_timer_get_time();
+            draw_scope(rms, window_pk);
+            const int32_t dt = (int32_t)(esp_timer_get_time() - t0);
+            if (dt > draw_us_max) draw_us_max = dt;
+            draw_us_sum += dt;
+            draw_count++;
+        }
+
+        // Einmal pro Sekunde eine Zeile ins Log, mit Tasten und Batterie.
+        const int64_t now = esp_timer_get_time();
+        if (now - last_log >= 1000000) {
+            last_log = now;
+            const int32_t rms = (sum_count > 0)
+                                    ? (int32_t)sqrt((double)(sum_sq / sum_count))
+                                    : 0;
+            int raw = 0;
+            adc_oneshot_read(adc_handle, ADC_CHANNEL_3, &raw);
+            ESP_LOGI(TAG,
+                     "Pegel rms=%5d (%.1f dBFS)  peak=%5d  Skala=%5d  |  "
+                     "Zeichnen %d/%d ms von %d  |  BOOT=%s KEY=%s  Batterie=%d",
+                     (int)rms, 20.0f * log10f(((float)rms + 1.0f) / 32768.0f),
+                     (int)window_pk, (int)scope_scale,
+                     (int)(draw_count ? (draw_us_sum / draw_count / 1000) : 0),
+                     (int)(draw_us_max / 1000),
+                     kReadsPerFrame * kReadFrames * 1000 / 16000,
+                     gpio_get_level(BOOT_BUTTON_PIN) ? "offen" : "GEDRUECKT",
+                     gpio_get_level(KEY_BUTTON_PIN) ? "offen" : "GEDRUECKT",
+                     raw);
+            sum_sq      = 0;
+            sum_count   = 0;
+            window_pk   = 0;
+            draw_us_sum = 0;
+            draw_us_max = 0;
+            draw_count  = 0;
+        }
+    }
+}
+
 // --- app_main -------------------------------------------------------------
 
 extern "C" void app_main(void)
@@ -293,6 +488,10 @@ extern "C" void app_main(void)
     test_display();
     init_inputs();
 
+    vTaskDelay(pdMS_TO_TICKS(1500));   // Testbild kurz stehen lassen
+    visualize_mic();
+
+    // Nur erreichbar, wenn das Mikrofon nicht ansprechbar war.
     ESP_LOGI(TAG, "--- Laufende Ueberwachung (Tasten + Batterie) ---");
 
     while (true) {

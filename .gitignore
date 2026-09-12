@@ -4,3 +4,8 @@ sdkconfig
 sdkconfig.old
 sdkconfig.rlcd42
 build/
+
+# Vom IDF Component Manager heruntergeladen, aus idf_component.yml
+# reproduzierbar. dependencies.lock wird dagegen versioniert, damit der Build
+# auf allen Rechnern dieselben Versionen zieht.
+managed_components/

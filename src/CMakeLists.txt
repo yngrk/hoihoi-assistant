@@ -1,4 +1,4 @@
 idf_component_register(
-    SRCS "main.cpp" "gfx.cpp"
+    SRCS "main.cpp" "gfx.cpp" "audio.cpp"
     INCLUDE_DIRS "."
-    REQUIRES port_bsp driver esp_adc esp_timer esp_psram)
+    REQUIRES port_bsp driver esp_adc esp_timer esp_psram esp_codec_dev)
