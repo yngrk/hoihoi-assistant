@@ -52,6 +52,12 @@ static Listener listener;
 // der Anzeigetask liest nur Phase und Text.
 static Stt stt;
 
+// Wiedergabe der letzten Aufnahme. Zustand fuer die Anzeige, wie ueberall
+// hier in ausgerichteten 32-Bit-Worten ohne Mutex.
+static volatile int32_t play_active   = 0;
+static volatile int32_t play_ms       = 0;
+static volatile int32_t play_total_ms = 0;
+
 // Erwartete Teilnehmer am I2C-Bus, fuer eine lesbare Scan-Ausgabe.
 struct KnownDevice {
     uint8_t     addr;
@@ -343,7 +349,8 @@ static void init_inputs(void)
 // Entkoppelt laeuft die Anzeige exakt auf der Panelfrequenz und die Aufnahme in
 // ihrem eigenen Takt, ohne dass eine die andere zieht.
 
-static MicInput mic;
+static MicInput      mic;
+static SpeakerOutput speaker;
 
 // Aufteilung der Flaeche nach dem Entwurf: drei gestapelte Baender ueber die
 // volle Breite — Kennzahlen oben, Wellenbild in der Mitte, Pegelskala unten.
@@ -509,22 +516,31 @@ static void draw_stats(int32_t rms)
 
     // Pegel in dBFS gehoert fachlich zum Ton, steht aber als Zahl hier oben,
     // weil das Wellenband dafuer keinen Platz hat.
-    const int32_t amp = (rms < 1) ? 1 : rms;
-    snprintf(buf, sizeof(buf), "%ddB", (int)(20.0f * log10f((float)amp / 32768.0f)));
+    if (mic.running()) {
+        const int32_t amp = (rms < 1) ? 1 : rms;
+        snprintf(buf, sizeof(buf), "%ddB",
+                 (int)(20.0f * log10f((float)amp / 32768.0f)));
+    } else {
+        // Kein Messwert, weil der Wandler zu ist. "-90 dB" zu zeigen waere
+        // eine Zahl, die Stille behauptet, wo gar nicht gemessen wird.
+        snprintf(buf, sizeof(buf), "AUS");
+    }
     draw_field(kColLeftX, 128, "PEGEL", buf, 4);
 
     // Ergebnis des letzten Tastendrucks. Ohne diese Rueckmeldung waere nach
     // dem Loslassen nicht zu sehen, ob ueberhaupt etwas angekommen ist.
     if (listener.last_ms() > 0) {
         const int32_t pk = (listener.last_peak() < 1) ? 1 : listener.last_peak();
-        snprintf(buf, sizeof(buf), "%d.%ds  %ddB",
+        const int32_t ef = (listener.last_rms() < 1) ? 1 : listener.last_rms();
+        snprintf(buf, sizeof(buf), "%d.%ds  %d/%ddB",
                  (int)(listener.last_ms() / 1000),
                  (int)((listener.last_ms() / 100) % 10),
-                 (int)(20.0f * log10f((float)pk / 32768.0f)));
+                 (int)(20.0f * log10f((float)pk / 32768.0f)),
+                 (int)(20.0f * log10f((float)ef / 32768.0f)));
     } else {
         snprintf(buf, sizeof(buf), "--");
     }
-    draw_field(kColLeftX, 180, "LETZTE AUFNAHME", buf, 2);
+    draw_field(kColLeftX, 180, "LETZTE AUFNAHME  SPITZE/EFFEKTIV", buf, 2);
 
     // --- Rechte Spalte: Systemzustand, klein ---
     const int64_t up = esp_timer_get_time() / 1000000;
@@ -551,45 +567,71 @@ static void draw_stats(int32_t rms)
 // Aufnahmeansicht: belegt dasselbe Band wie die Kennzahlen, zeigt aber nur
 // dreierlei — dass aufgenommen wird, wie lange noch Platz ist, und was
 // bisher verstanden wurde.
+// Wiedergabezeichen: nach rechts zeigendes Dreieck, an derselben Stelle wie
+// der Aufnahmepunkt.
+static void draw_play_symbol(int cx, int cy, int r)
+{
+    for (int dy = -r; dy <= r; dy++) {
+        const int d = (dy < 0) ? -dy : dy;
+        display->hline(cx - r, cx + r - 2 * d, cy + dy, ColorBlack);
+    }
+}
+
 static void draw_listening(void)
 {
     char buf[48];
     static char text[Stt::kMaxText];   // static: 512 Byte gehoeren nicht auf
                                        // den Stack des Anzeigetasks
 
-    const bool    hoert = listener.listening();
-    const int32_t ms    = hoert ? listener.elapsed_ms() : listener.last_ms();
+    const bool    hoert  = listener.listening();
+    const bool    spielt = (play_active != 0);
+    const int32_t ms     = spielt ? play_ms
+                                  : (hoert ? listener.elapsed_ms()
+                                           : listener.last_ms());
 
-    snprintf(buf, sizeof(buf), "%d.%d s / %d s",
-             (int)(ms / 1000), (int)((ms / 100) % 10), Listener::kMaxSeconds);
-    draw_header(hoert ? "AUFNAHME" : "AUFNAHME BEENDET", buf);
+    // Der Balken zeigt bei der Aufnahme den Weg zur Zehn-Sekunden-Schranke,
+    // bei der Wiedergabe den Weg durch das Aufgenommene. Beides ist dieselbe
+    // Frage — wie weit ist das hier? — und darf dieselbe Form haben.
+    const int32_t voll = spielt ? (play_total_ms > 0 ? play_total_ms : 1)
+                                : Listener::kMaxSeconds * 1000;
+
+    if (spielt) {
+        snprintf(buf, sizeof(buf), "%d.%d s / %d.%d s",
+                 (int)(ms / 1000), (int)((ms / 100) % 10),
+                 (int)(voll / 1000), (int)((voll / 100) % 10));
+    } else {
+        snprintf(buf, sizeof(buf), "%d.%d s / %d s",
+                 (int)(ms / 1000), (int)((ms / 100) % 10), Listener::kMaxSeconds);
+    }
+    draw_header(spielt ? "WIEDERGABE"
+                       : (hoert ? "AUFNAHME" : "AUFNAHME BEENDET"), buf);
 
     // Aufnahmezeichen: gefuellter Punkt, im Sekundentakt blinkend. Das
     // Blinken ist der Teil, der auch aus dem Augenwinkel ankommt — ein
     // stehender Punkt sieht aus wie ein gedrucktes Symbol.
-    if (hoert && ((ms / 400) % 2) == 0) {
+    if (spielt) {
+        draw_play_symbol(kDotCX, kDotCY, kDotR);
+    } else if (hoert && ((ms / 400) % 2) == 0) {
         display->fill_circle(kDotCX, kDotCY, kDotR, ColorBlack);
     } else {
         display->circle(kDotCX, kDotCY, kDotR, ColorBlack);
         display->circle(kDotCX, kDotCY, kDotR - 1, ColorBlack);
     }
 
-    // Zeitbalken: nicht Schmuck, sondern die Antwort auf die Frage, wie lange
-    // man noch sprechen kann, bevor die Schranke aus listen.h greift.
     display->rect(kBarX0, kBarY0, kBarX1, kBarY1, ColorBlack);
 
-    const int32_t voll = Listener::kMaxSeconds * 1000;
-    int32_t       anteil = (ms > voll) ? voll : ms;
-    const int     innen  = kBarX1 - kBarX0 - 4;
-    const int     w      = (int)((int64_t)innen * anteil / voll);
+    int32_t   anteil = (ms > voll) ? voll : ms;
+    const int innen  = kBarX1 - kBarX0 - 4;
+    const int w      = (int)((int64_t)innen * anteil / voll);
     if (w > 0) {
         display->fill_rect(kBarX0 + 2, kBarY0 + 2, kBarX0 + 2 + w - 1,
                            kBarY1 - 2, ColorBlack);
     }
     // Sekundenmarken, damit der Balken eine Skala hat und nicht nur eine
     // Laenge. Sie werden invertiert, wo der Balken schon steht.
-    for (int s = 1; s < Listener::kMaxSeconds; s++) {
-        const int x = kBarX0 + 2 + innen * s / Listener::kMaxSeconds;
+    const int marken = spielt ? (int)((voll + 999) / 1000) : Listener::kMaxSeconds;
+    for (int s = 1; s < marken; s++) {
+        const int x = kBarX0 + 2 + innen * s / marken;
         display->vline(x, kBarY0 + 2, kBarY1 - 2,
                        (x < kBarX0 + 2 + w) ? ColorWhite : ColorBlack);
     }
@@ -629,6 +671,7 @@ static bool aufnahme_ansicht(void)
     static int64_t bis = 0;
 
     const bool aktiv = listener.listening()
+                       || play_active != 0
                        || stt.phase() == Stt::Phase::Verbindet
                        || stt.phase() == Stt::Phase::Hoert
                        || stt.phase() == Stt::Phase::Wartet;
@@ -671,6 +714,17 @@ static void draw_scope(const int16_t *lo, const int16_t *hi, int head,
         } else {
             display->vline(i, y0, y1, ColorBlack);
         }
+    }
+
+    // Ohne laufendes Mikrofon bleibt von der Kurve nur die Nulllinie. Die
+    // Beschriftung sagt, warum — eine gerade Linie allein saehe aus wie ein
+    // Defekt.
+    if (!mic.running()) {
+        const char *s = "MIKROFON AUS - KEY GEDRUECKT HALTEN";
+        const int   w = Canvas::text_width(s, 1);
+        display->fill_rect((LCD_WIDTH - w) / 2 - 4, kScopeCenter - 6,
+                           (LCD_WIDTH + w) / 2 + 3, kScopeCenter + 8, ColorWhite);
+        display->text((LCD_WIDTH - w) / 2, kScopeCenter - 3, s, ColorBlack, 1);
     }
 
     display->rect(0, kMeterTop, LCD_WIDTH - 1, kMeterBottom, ColorBlack);
@@ -743,6 +797,53 @@ static void stats_task(void *)
     }
 }
 
+static void playback_task(void *)
+{
+    // 20 ms je Schreibvorgang: klein genug, dass ein neuer Tastendruck die
+    // Wiedergabe fast sofort abbricht, gross genug, um nicht in Aufrufen zu
+    // ertrinken.
+    static const size_t kChunk = kSampleRate / 50;
+
+    bool war_aktiv = false;
+
+    while (true) {
+        const bool aktiv = listener.listening();
+
+        if (!aktiv && war_aktiv) {
+            const int16_t *pcm = listener.samples();
+            const size_t   n   = listener.sample_count();
+
+            if (pcm != nullptr && n > 0 && speaker.start() == ESP_OK) {
+                play_total_ms = (int32_t)((int64_t)n * 1000 / kSampleRate);
+                play_ms       = 0;
+                play_active   = 1;
+                ESP_LOGI(TAG, "Wiedergabe: %u Frames, %d ms.",
+                         (unsigned)n, (int)play_total_ms);
+
+                for (size_t i = 0; i < n; i += kChunk) {
+                    size_t m = n - i;
+                    if (m > kChunk) m = kChunk;
+                    if (speaker.write_mono(&pcm[i], m) != ESP_OK) {
+                        ESP_LOGW(TAG, "Wiedergabe abgebrochen (Schreibfehler).");
+                        break;
+                    }
+                    play_ms = (int32_t)((int64_t)(i + m) * 1000 / kSampleRate);
+
+                    // Wer erneut drueckt, will sprechen und nicht zuhoeren.
+                    if (listener.listening()) break;
+                }
+
+                play_active = 0;
+                speaker.stop();
+                ESP_LOGI(TAG, "Wiedergabe beendet.");
+            }
+        }
+
+        war_aktiv = aktiv;
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
 static void visualize_mic(void)
 {
     ESP_LOGI(TAG, "--- Mikrofon-Visualisierung ---");
@@ -799,66 +900,105 @@ static void visualize_mic(void)
     // Niedrige Prioritaet: die Sensorwerte duerfen warten, Bild und Ton nicht.
     xTaskCreatePinnedToCore(stats_task, "stats", 3072, nullptr, 2, nullptr, 0);
 
+    if (speaker.begin(i2c_bus, mic.sample_rate()) == ESP_OK) {
+        xTaskCreatePinnedToCore(playback_task, "playback", 3072, nullptr, 3,
+                                nullptr, 0);
+        ESP_LOGI(TAG, "  Wiedergabe bereit: nach dem Loslassen laeuft die "
+                      "Aufnahme ueber den Lautsprecher zurueck.");
+    } else {
+        ESP_LOGW(TAG, "  Kein Lautsprecher — es wird aufgenommen, aber nicht "
+                      "zurueckgespielt.");
+    }
+
     static int16_t block[kReadFrames];
     int64_t        sum_sq    = 0;
     int32_t        sum_count = 0;
     int32_t        window_pk = 0;
     int64_t        last_log  = esp_timer_get_time();
 
+    int32_t rms = 0;
+
     while (true) {
-        if (mic.read_mono(block, kReadFrames) != ESP_OK) {
+        // Die Taste zuerst, unabhaengig vom Mikrofon: solange nicht
+        // aufgenommen wird, gibt es keinen Audioblock, an dem sich die
+        // Abfrage aufhaengen koennte. Der 20-ms-Takt bleibt derselbe, und
+        // damit auch die Entprellung.
+        listener.poll_key(gpio_get_level(KEY_BUTTON_PIN) == 0);
+
+        // Der Wandler laeuft nur waehrend einer Aufnahme. Ein Geraet mit
+        // Mikrofon soll nicht dauerhaft zuhoeren — und das ist nichts, was
+        // man glauben muessen darf: zwischen den Aufnahmen ist der ES7210
+        // zugeklappt, nicht nur ungelesen.
+        if (listener.listening() && !mic.running()) {
+            mic.start();
+        } else if (!listener.listening() && mic.running()) {
+            mic.stop();
+
+            // Wellenbild auf die Nulllinie zuruecksetzen. Das stehengelassene
+            // Bild der letzten Aufnahme sähe aus wie ein laufendes Signal.
+            xSemaphoreTake(scope_lock, portMAX_DELAY);
+            memset(col_min, 0, sizeof(col_min));
+            memset(col_max, 0, sizeof(col_max));
+            scope_scale = kScaleFloor;
+            shared_rms  = 0;
+            shared_peak = 0;
+            xSemaphoreGive(scope_lock);
+
+            rms       = 0;
+            sum_sq    = 0;
+            sum_count = 0;
+            window_pk = 0;
+        }
+
+        if (!mic.running()) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+        } else if (mic.read_mono(block, kReadFrames) != ESP_OK) {
             ESP_LOGW(TAG, "  Lesefehler, naechster Versuch.");
             vTaskDelay(pdMS_TO_TICKS(20));
-            continue;
-        }
-
-        // Taste und Mitschnitt zuerst: der Block liegt frisch vor, und die
-        // Abtastung im 20-ms-Takt ist zugleich die Entprellung.
-        listener.poll_key(gpio_get_level(KEY_BUTTON_PIN) == 0);
-        listener.feed(block, kReadFrames);
-
-        int16_t lo[kColumnsPerRead];
-        int16_t hi[kColumnsPerRead];
-        int32_t block_peak = 0;
-
-        for (int c = 0; c < kColumnsPerRead; c++) {
-            int16_t cl = INT16_MAX;
-            int16_t ch = INT16_MIN;
-            for (int k = 0; k < kFramesPerColumn; k++) {
-                const int16_t s = block[c * kFramesPerColumn + k];
-                if (s < cl) cl = s;
-                if (s > ch) ch = s;
-
-                const int32_t a = (s < 0) ? -(int32_t)s : (int32_t)s;
-                if (a > block_peak) block_peak = a;
-                if (a > window_pk)  window_pk  = a;
-                sum_sq += (int64_t)s * s;
-                sum_count++;
-            }
-            lo[c] = cl;
-            hi[c] = ch;
-        }
-
-        const int32_t rms = (sum_count > 0)
-                                ? (int32_t)sqrt((double)(sum_sq / sum_count))
-                                : 0;
-
-        xSemaphoreTake(scope_lock, portMAX_DELAY);
-        for (int c = 0; c < kColumnsPerRead; c++) {
-            col_min[col_head] = lo[c];
-            col_max[col_head] = hi[c];
-            col_head = (col_head + 1) % LCD_WIDTH;
-        }
-        // Vollausschlag nachfuehren: sofort auf, langsam zu.
-        if (block_peak > scope_scale) {
-            scope_scale = block_peak;
         } else {
-            scope_scale -= (scope_scale - kScaleFloor) / 24;
+            listener.feed(block, kReadFrames);
+
+            int16_t lo[kColumnsPerRead];
+            int16_t hi[kColumnsPerRead];
+            int32_t block_peak = 0;
+
+            for (int c = 0; c < kColumnsPerRead; c++) {
+                int16_t cl = INT16_MAX;
+                int16_t ch = INT16_MIN;
+                for (int k = 0; k < kFramesPerColumn; k++) {
+                    const int16_t s = block[c * kFramesPerColumn + k];
+                    if (s < cl) cl = s;
+                    if (s > ch) ch = s;
+
+                    const int32_t a = (s < 0) ? -(int32_t)s : (int32_t)s;
+                    if (a > block_peak) block_peak = a;
+                    if (a > window_pk)  window_pk  = a;
+                    sum_sq += (int64_t)s * s;
+                    sum_count++;
+                }
+                lo[c] = cl;
+                hi[c] = ch;
+            }
+
+            rms = (sum_count > 0) ? (int32_t)sqrt((double)(sum_sq / sum_count)) : 0;
+
+            xSemaphoreTake(scope_lock, portMAX_DELAY);
+            for (int c = 0; c < kColumnsPerRead; c++) {
+                col_min[col_head] = lo[c];
+                col_max[col_head] = hi[c];
+                col_head = (col_head + 1) % LCD_WIDTH;
+            }
+            // Vollausschlag nachfuehren: sofort auf, langsam zu.
+            if (block_peak > scope_scale) {
+                scope_scale = block_peak;
+            } else {
+                scope_scale -= (scope_scale - kScaleFloor) / 24;
+            }
+            if (scope_scale < kScaleFloor) scope_scale = kScaleFloor;
+            shared_rms  = rms;
+            shared_peak = window_pk;
+            xSemaphoreGive(scope_lock);
         }
-        if (scope_scale < kScaleFloor) scope_scale = kScaleFloor;
-        shared_rms  = rms;
-        shared_peak = window_pk;
-        xSemaphoreGive(scope_lock);
 
         // Einmal pro Sekunde eine Zeile ins Log, mit Tasten und Batterie.
         const int64_t now = esp_timer_get_time();
@@ -870,7 +1010,7 @@ static void visualize_mic(void)
             ESP_LOGI(TAG,
                      "Pegel rms=%5d (%.1f dBFS)  peak=%5d  Skala=%5d  |  "
                      "Bild %d/%d ms, %d/s  |  TE %d us (%d Hz, %d Timeouts, DMA %d)"
-                     "  |  BOOT=%s KEY=%s  Batterie=%d",
+                     "  |  MIK=%s BOOT=%s KEY=%s  Batterie=%d",
                      (int)rms, 20.0f * log10f(((float)rms + 1.0f) / 32768.0f),
                      (int)window_pk, (int)scope_scale,
                      (int)(fc ? (frame_us_sum / fc / 1000) : 0),
@@ -881,6 +1021,7 @@ static void visualize_mic(void)
                                : 0),
                      (int)display->te_timeouts(),
                      (int)display->dma_timeouts(),
+                     mic.running() ? "AN" : "aus",
                      gpio_get_level(BOOT_BUTTON_PIN) ? "offen" : "GEDRUECKT",
                      gpio_get_level(KEY_BUTTON_PIN) ? "offen" : "GEDRUECKT",
                      raw);

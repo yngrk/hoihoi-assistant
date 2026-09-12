@@ -81,7 +81,7 @@ src/user_config.h         Pinbelegung
 src/gfx.h, src/gfx.cpp    Clippende Zeichenschicht über dem Treiber
 src/display_sync.h, .cpp  DisplayPort mit Rückmeldung über das DMA-Ende
 src/font5x7.h, .cpp       5×7-Bitmapfont, ASCII 0x20–0x7F plus ä ö ü ß
-src/audio.h, src/audio.cpp  Mikrofoneingang: ES7210 über I²C, Daten über I²S
+src/audio.h, src/audio.cpp  ES7210 und ES8311 im Vollduplex an einem I²S-Port
 src/listen.h, .cpp        Zuhören auf Tastendruck, Mitschnitt im PSRAM
 src/net.h, .cpp           WLAN im Stationsbetrieb
 src/stt.h, .cpp           Sprache zu Text über die Realtime-API von OpenAI
@@ -244,6 +244,108 @@ wenn ohnehin ein Audioblock vorliegt, und dieser Abtastabstand ist zugleich die
 Entprellung. Zwei Abfragen ohne Kontakt gelten als Loslassen — ein einzelner
 Prellimpuls während des Haltens schnitte sonst mitten im Wort ab.
 
+### Was vorne und hinten abgeschnitten wird
+
+Von jeder Aufnahme fallen die ersten 120 und die letzten 60 ms weg. Das ist
+kein Sicherheitsabstand, sondern die Antwort auf zwei gemessene Störungen:
+das Einschalten des ES7210 setzt einen Einschwinger ab, und das Loslassen der
+Taste knackt.
+
+Beide waren **lauter als jedes gesprochene Wort**. Vor dem Schnitt lag die
+Spitze jeder Aufnahme bei rund 14000 Zählern, danach bei 2700 bis 4200 — die
+Artefakte übertrafen das Nutzsignal um 12 bis 14 dB. Sie gingen bis dahin
+unbesehen in die Transkription.
+
+Gesprochen wird in diesen Abschnitten ohnehin nicht: vorne ist die Taste gerade
+erst heruntergegangen, hinten geht sie gerade hoch. Wer bis zum letzten Moment
+durchspricht, verliert die letzte Silbe — dann ist `kTailMs` in
+[src/listen.h](src/listen.h) die Stellschraube.
+
+### Was am Ende gemessen wird
+
+Die Kennzahlen entstehen in einem Durchgang über den fertigen Mitschnitt
+(`Listener::measure()`), nicht mitlaufend in `feed()`. Anders ginge es nicht:
+erst beim Ende steht fest, wo geschnitten wird, und ein mitlaufender Zähler
+hätte den Knacks am Schluss längst eingerechnet. `feed()` bleibt damit im
+Audiopfad das, was es sein soll — Kopieren.
+
+Drei Zahlen, weil keine davon allein trägt:
+
+| Zahl | wofür |
+|------|-------|
+| Spitze | Übersteuerung und Artefakte |
+| Effektivwert | die tatsächliche Lautheit |
+| Grundrauschen | leisestes 100-ms-Fenster, also eine Sprechpause |
+
+Der Abstand zwischen Effektivwert und Grundrauschen ist der Störabstand, und
+das ist die einzige Zahl, die für die Erkennung wirklich zählt. Auf der
+Hardware gemessen: Sprache bei −34 dBFS, Grundrauschen zwischen −58 und
+−64 dBFS, also **22 bis 29 dB Störabstand**.
+
+Das Fenster statt einer eigenen Stille-Aufnahme, weil es robust ist: ein
+einzelner Nadelimpuls verdirbt höchstens ein Fenster, und der Wert fällt in
+jeder Aufnahme nebenbei mit ab.
+
+Die Spitze liegt damit bei −18 dBFS, es sind also 18 dB Luft nach oben. Die
+bleiben ungenutzt, und das ist Absicht: digitale Verstärkung hebt Sprache und
+Rauschen gleichermaßen, der Störabstand ändert sich um kein Dezibel, und die
+Realtime-API normalisiert eingehendes Audio ohnehin selbst. Der einzige
+wirksame Hebel ist der Abstand zum Mikrofon — jede Halbierung bringt 6 dB.
+
+## Vollduplex: beide Wandler an einem I²S-Port
+
+Auf der Platine gibt es nur ein BCLK, ein LRCLK und ein MCLK. ES7210 (Aufnahme)
+und ES8311 (Wiedergabe) hängen am selben Taktpaar, zwei I²S-Controller könnten
+dieselben Pins nicht gemeinsam treiben. Der Port wird deshalb einmal angelegt
+(`port_begin()` in [src/audio.cpp](src/audio.cpp)) und von beiden Klassen
+benutzt; wer zuerst `begin()` ruft, legt die Abtastrate fest.
+
+Zwei Eigenheiten des Treibers haben das mehr Mühe gekostet, als es aussieht:
+
+**Die Konfiguration muss bytegleich sein.** `i2s_new_channel()` liefert TX und
+RX auf einmal, aber der Treiber erkennt Vollduplex erst, wenn beide Kanäle eine
+`memcmp`-identische `i2s_std_config_t` bekommen — die `gpio_cfg` eingeschlossen.
+Also stehen in **beiden** Konfigurationen `dout` und `din`, obwohl je eine
+Richtung sie nicht braucht. Der zuerst eingerichtete Kanal bleibt Master, der
+zweite wird automatisch zum `full_duplex_slave` herabgestuft.
+
+**Es darf nur ein Datenobjekt geben.** Getrennte `audio_codec_new_i2s_data()`
+je Richtung sehen sauberer aus und sind falsch. `i2s_ll_share_bck_ws()` lässt
+RX am Takt von TX hängen: wird TX abgeschaltet, verliert das Mikrofon seinen
+Takt. `esp_codec_dev` verhindert genau das — aber die Buchführung dazu
+(`in_enable`, `out_enable`, „When RX is working TX disable should be blocked")
+liegt in **einem** `i2s_data_t`. Mit zwei Objekten weiß keines vom anderen.
+
+Das Fehlerbild war entsprechend: die erste Aufnahme lief, jede weitere lieferte
+`0 Frames, Spitze 0` und Lesefehler — das Schließen des Lautsprechers nach der
+Wiedergabe hatte dem Mikrofon den Takt abgedreht. Mit einem gemeinsamen
+Datenobjekt: sechs Aufnahmen, sechs Wiedergaben, kein Lesefehler.
+
+### Mikrofon nur bei Tastendruck
+
+Der ES7210 wird in `MicInput::start()` geöffnet und in `stop()` wieder
+geschlossen, nicht einmalig beim Hochfahren. Zwischen den Aufnahmen
+digitalisiert er nichts. Ein Gerät mit Mikrofon soll nicht dauerhaft zuhören,
+und ob es das tut, darf man nicht glauben müssen — es ist derselbe Baustein,
+der sonst läuft. Das Öffnen kostet gemessen 26 bis 53 ms und fällt beim
+Tastendruck nicht auf; im Log steht `MIK=AN` beziehungsweise `MIK=aus`.
+
+Die Verstärkung steht auf 37,5 dB, dem Maximum des ES7210 (0 bis 33 dB in
+Dreierschritten, dann 34,5, 36, 37,5). Sie anzuheben hat den Störabstand nicht
+verbessert — Rauschteppich und Signal steigen gemeinsam —, aber sie kostet auch
+nichts.
+
+### Wiedergabe als Diagnosemittel
+
+Nach dem Loslassen spielt das Gerät die Aufnahme über den ES8311 zurück. Das
+ist kein Bestandteil des Endprodukts, sondern das einzige Mittel, mit dem sich
+beurteilen lässt, was das Mikrofon tatsächlich aufgenommen hat.
+
+`volume` bei `esp_codec_dev` ist dabei kein Leistungsanteil, sondern ein Punkt
+auf einer Kurve, die 0 bis 100 linear auf −50 bis 0 dB abbildet. Der
+zwischenzeitliche Wert 70 waren also nicht „etwas leiser", sondern −15 dB, und
+genau so klang es.
+
 ## Sprache zu Text
 
 Freie Transkription auf dem Gerät selbst gibt es nicht: Whisper tiny sind rund
@@ -330,6 +432,4 @@ alles andere außerhalb von ASCII wird ein Fragezeichen.
   selbst trainiertes Modell nach Art von microWakeWord, das aus
   TTS-erzeugten Beispielen entsteht und sprecherunabhängig arbeitet, dafür aber
   eine Trainingspipeline außerhalb der Firmware braucht.
-- **Audioausgabe**: Der ES8311 ist noch nicht initialisiert, nur der ES7210 für
-  die Aufnahme. Referenz dafür ist Waveshares Beispiel `07_Audio_Test`.
 - **microSD und RTC**: noch nicht angebunden.

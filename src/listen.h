@@ -30,6 +30,25 @@ class Listener {
     // Obergrenze einer Aufnahme, und danach ist der Puffer bemessen.
     static const int kMaxSeconds = 10;
 
+    // Die ersten Millisekunden nach dem Einschalten des Wandlers werden
+    // verworfen. Der ES7210 gibt beim Oeffnen einen Einschwinger ab, der als
+    // Knacks im Mitschnitt steht — und als Spitzenwert am Vollausschlag, was
+    // jede Messung darueber unbrauchbar macht. Gesprochen wird in dieser
+    // Zeit ohnehin nicht, die Taste ist gerade erst heruntergegangen.
+    static const int32_t kSkipMs = 120;
+
+    // Fensterbreite fuer die Schaetzung des Grundrauschens. Der leiseste
+    // Abschnitt einer Aufnahme ist eine Sprechpause, und dessen Effektivwert
+    // ist der Rauschteppich. Robuster als eine eigene Stille-Aufnahme: ein
+    // einzelner Nadelimpuls verdirbt hoechstens ein Fenster, nicht die Messung.
+    static const int32_t kNoiseMs = 100;
+
+    // Und dasselbe am hinteren Ende: das Loslassen der Taste knackt genauso
+    // wie das Einschalten des Wandlers, in den Messungen lag die Spitze jeder
+    // Aufnahme gut 20 ms vor Schluss. Gesprochen wird hier nicht mehr, die
+    // Taste geht ja gerade hoch.
+    static const int32_t kTailMs = 60;
+
     // So viele Abfragen (je 20 ms) muss die Taste offen sein, bevor die
     // Aufnahme endet. Ein einzelner Prellimpuls beim Halten wuerde sonst
     // mitten im Wort abschneiden.
@@ -54,6 +73,8 @@ class Listener {
     // Dauer und Spitzenpegel der zuletzt abgeschlossenen Aufnahme.
     int32_t last_ms() const { return last_ms_; }
     int32_t last_peak() const { return last_peak_; }
+    int32_t last_rms() const { return last_rms_; }
+    int32_t last_noise() const { return last_noise_; }
 
     // Die zuletzt abgeschlossene Aufnahme. Gueltig, bis die naechste beginnt.
     const int16_t *samples() const { return buf_; }
@@ -72,7 +93,13 @@ class Listener {
     uint32_t rate_     = 16000;
 
     size_t  fill_ = 0;           // nur im Aufnahmetask angefasst
-    int32_t peak_ = 0;
+    size_t  skip_ = 0;           // noch zu verwerfende Frames
+
+    // Alle Kennzahlen entstehen in einem Durchgang in stop(), nicht mitlaufend
+    // in feed(). Erst dort steht fest, wo die Aufnahme endet — und ohne dieses
+    // Ende laesst sich der Knacks am Schluss nicht aus der Rechnung halten.
+    // feed() bleibt damit auch das, was es sein soll: Kopieren.
+    void measure();
 
     // Zustand, den auch der Anzeigetask liest. Ausgerichtete 32-Bit-Worte
     // ohne Mutex, wie bei den Umweltwerten in main.cpp: Schreiben und Lesen
@@ -81,6 +108,8 @@ class Listener {
     volatile int32_t started_ms_  = 0;
     volatile int32_t last_ms_     = 0;
     volatile int32_t last_peak_   = 0;
+    volatile int32_t last_rms_    = 0;
+    volatile int32_t last_noise_  = 0;
     volatile int32_t last_frames_ = 0;
     volatile int32_t live_frames_ = 0;
 

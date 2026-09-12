@@ -1,5 +1,6 @@
 #include "listen.h"
 
+#include <math.h>
 #include <string.h>
 
 #include <esp_heap_caps.h>
@@ -43,7 +44,7 @@ void Listener::start()
 {
     fill_        = 0;
     live_frames_ = 0;
-    peak_        = 0;
+    skip_        = (size_t)rate_ * kSkipMs / 1000;
     started_ms_  = now_ms();
     last_frames_ = 0;
     listening_   = 1;
@@ -58,14 +59,66 @@ void Listener::stop(const char *grund)
     // Zeitpunkt schon vollstaendig vorfinden. Andersherum saehe der
     // Transkriptionstask fuer einen Moment noch last_frames_ == 0 und
     // schickte das Ende der Aeusserung nicht mehr los.
-    last_ms_     = now_ms() - started_ms_;
-    last_peak_   = peak_;
+    last_ms_ = now_ms() - started_ms_;
+
+    // Den Knacks vom Loslassen abschneiden, siehe kTailMs — aber nur, wenn
+    // danach noch etwas uebrig bleibt. Ein Tastendruck, der kuerzer war als
+    // der Schnitt, soll eine leere Aufnahme ergeben und keine negative Laenge.
+    const size_t tail = (size_t)rate_ * kTailMs / 1000;
+    fill_ = (fill_ > tail) ? (fill_ - tail) : 0;
+
+    measure();
     last_frames_ = (int32_t)fill_;
     listening_   = 0;
 
     // Der Puffer bleibt stehen — hier setzt spaeter die Worterkennung an.
-    ESP_LOGI(TAG, "Zuhoeren beendet (%s): %d ms, %u Frames, Spitze %d.",
-             grund, (int)last_ms_, (unsigned)fill_, (int)peak_);
+    // Spitze und Effektivwert zusammen, denn allein sagt keiner von beiden
+    // genug: ein einzelner Einschaltknacks treibt die Spitze auf Vollausschlag,
+    // waehrend die Aufnahme in Wahrheit duenn ist. Erst der Abstand zwischen
+    // beiden zeigt, was wirklich anliegt.
+    // Die Fundstelle der Spitze dazu: liegt sie gleich am Anfang, ist sie kein
+    // Sprachsignal, sondern der Rest des Einschwingers — und dann taugt sie
+    // nicht als Bezug fuer irgendeine Verstaerkung.
+    ESP_LOGI(TAG, "Zuhoeren beendet (%s): %d ms, %u Frames, "
+                  "Spitze %d, Effektivwert %d, Grundrauschen %d.",
+             grund, (int)last_ms_, (unsigned)fill_, (int)last_peak_,
+             (int)last_rms_, (int)last_noise_);
+}
+
+// Ein Durchgang ueber den fertigen Mitschnitt. Spitze und Effektivwert sagen
+// einzeln zu wenig: ein Knacks treibt die Spitze hoch, waehrend die Aufnahme
+// duenn ist. Das Grundrauschen kommt als leisestes Fenster dazu — das ist eine
+// Sprechpause, und der Abstand zum Effektivwert ist der Stoerabstand, die
+// einzige Zahl, die fuer die Erkennung wirklich zaehlt.
+void Listener::measure()
+{
+    const size_t fenster = (size_t)rate_ * kNoiseMs / 1000;
+
+    int32_t spitze  = 0;
+    int64_t summe   = 0;
+    int64_t blk     = 0;
+    size_t  blk_n   = 0;
+    int32_t rauschen = -1;
+
+    for (size_t i = 0; i < fill_; i++) {
+        const int16_t s = buf_[i];
+        const int32_t a = (s < 0) ? -(int32_t)s : (int32_t)s;
+        if (a > spitze) spitze = a;
+
+        const int64_t q = (int64_t)s * s;
+        summe += q;
+        blk   += q;
+        if (fenster > 0 && ++blk_n >= fenster) {
+            const int32_t r = (int32_t)sqrt((double)(blk / (int64_t)blk_n));
+            if (rauschen < 0 || r < rauschen) rauschen = r;
+            blk   = 0;
+            blk_n = 0;
+        }
+    }
+
+    last_peak_  = spitze;
+    last_rms_   = (fill_ > 0) ? (int32_t)sqrt((double)(summe / (int64_t)fill_)) : 0;
+    last_noise_ = (rauschen > 0) ? rauschen : 0;
 }
 
 void Listener::poll_key(bool pressed)
@@ -102,17 +155,20 @@ void Listener::feed(const int16_t *pcm, size_t frames)
 {
     if (listening_ == 0 || buf_ == nullptr) return;
 
+    // Den Einschwinger des Wandlers vorne abschneiden, siehe kSkipMs.
+    if (skip_ > 0) {
+        const size_t weg = (skip_ < frames) ? skip_ : frames;
+        skip_  -= weg;
+        pcm    += weg;
+        frames -= weg;
+        if (frames == 0) return;
+    }
+
     size_t room = capacity_ - fill_;
     if (frames < room) room = frames;
 
     if (room > 0) {
         memcpy(&buf_[fill_], pcm, room * sizeof(int16_t));
-
-        for (size_t i = 0; i < room; i++) {
-            const int16_t s = pcm[i];
-            const int32_t a = (s < 0) ? -(int32_t)s : (int32_t)s;
-            if (a > peak_) peak_ = a;
-        }
         fill_ += room;
         live_frames_ = (int32_t)fill_;
     }
