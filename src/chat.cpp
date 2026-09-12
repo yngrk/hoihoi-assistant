@@ -38,7 +38,7 @@ esp_err_t Chat::begin(Stt *quelle, const char *key, const char *model)
 {
     quelle_ = quelle;
     key_    = key;
-    model_  = (model != nullptr && model[0] != '\0') ? model : "gpt-4o-mini";
+    model_  = (model != nullptr && model[0] != '\0') ? model : "gpt-5.6-luna";
 
     lock_ = xSemaphoreCreateMutex();
     if (lock_ == nullptr) return ESP_ERR_NO_MEM;

@@ -46,7 +46,7 @@
 // kein Grund, den Bau scheitern zu lassen — der Standardwert ist derselbe,
 // der in der Vorlage steht.
 #ifndef CHAT_MODEL
-#define CHAT_MODEL "gpt-4o-mini"
+#define CHAT_MODEL "gpt-5.6-luna"
 #endif
 #ifndef TTS_MODEL
 #define TTS_MODEL "gpt-4o-mini-tts"
