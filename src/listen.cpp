@@ -1,5 +1,7 @@
 #include "listen.h"
 
+#include "nachtrag.h"
+
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -53,7 +55,11 @@ void Listener::start()
     last_frames_ = 0;
     listening_   = 1;
 
-    ESP_LOGI(TAG, "Zuhoeren gestartet.");
+    // Nicht ESP_LOGI: dieser Aufruf kommt aus dem Aufnahmetask, und zwar in
+    // dem Augenblick, in dem die Taste heruntergeht. Eine blockierende
+    // Ausgabe hier schoebe das Oeffnen des Mikrofons um Zehntelsekunden nach
+    // hinten — genau das erste Wort.
+    nachtrag::schreiben('I', TAG, "Zuhoeren gestartet.");
 }
 
 void Listener::nachklang_erwarten()
@@ -198,7 +204,7 @@ void Listener::feed(const int16_t *pcm, size_t frames)
                 n += snprintf(&zeile[n], sizeof(zeile) - n, "%s%d",
                               i ? " " : "", (int)einschwing_[i]);
             }
-            ESP_LOGI(TAG, "Nachklang je 20 ms: %s", zeile);
+            nachtrag::schreiben('I', TAG, "Nachklang je 20 ms: %s", zeile);
         }
 
         if (frames == 0) return;

@@ -521,7 +521,7 @@ nachher:
 
 | Abschnitt | vorher ms | jetzt ms |
 |---|---:|---:|
-| Loslassen → Endtext | 536 | 699 |
+| Loslassen → Endtext | 536 | 560 |
 | Chat: TLS-Handschlag | 793 | — |
 | Chat: Anfrage → Antwort | 2320 | 1240 |
 | Stimme: TLS-Handschlag | 802 | — |
@@ -601,6 +601,54 @@ Die Anzeige stockt unter drei gleichzeitigen Handschlägen weiterhin sichtbar
 (`Bild 113/1177 ms, 15/s` für eine Sekunde). Das kostet nichts als Glätte und
 steht unter den offenen Punkten.
 
+### Warum der Aufnahmetask nicht ins Log schreibt
+
+Der Aufnahmetask liegt auf Priorität 6 und wurde trotzdem regelmäßig für
+Hunderte von Millisekunden ausgebremst. Aus einem Tastendruck von 2069 ms
+wurden 1160 ms Ton; der Satzanfang fehlte. Drei Erklärungen lagen nahe und
+waren alle falsch: die Prioritäten (ein Wachtask auf Kern 0 sah über zwei
+Runden kein einziges Mal, dass der Aufnahmetask bereit war und nicht drankam),
+die I²C-Sperre (die war es beim Wandler, aber nicht hier) und der
+TLS-Handschlag (der lief nebenher, nicht im Weg).
+
+Gefunden hat es eine Messung, die die Wartezeit in die Teile der Schleife
+zerlegt:
+
+```
+Stau 960 ms (davor 0, lesen 247, danach 0): websocket_task=955 IDLE0=949
+Stau 221 ms (davor 0, lesen  19, danach 0): IDLE0=28
+```
+
+Die Schleife stand 960 ms, aber nur 247 davon lagen in ihrer eigenen Arbeit.
+Die übrigen 713 ms vergingen **zwischen** zwei Durchgängen, und dort steht
+genau eine Anweisung: die Logzeile. Die zweite Meldung bestätigt es — 202 ms,
+um die erste auszugeben.
+
+Die Konsole hängt an UART0 mit 115200 Baud und zusätzlich am USB-Anschluss,
+und geschrieben wird blockierend: der schreibende Task wartet, bis beide
+Seiten abgenommen haben. Liest der Rechner am anderen Ende gerade nicht, wird
+daraus eine Zehntelsekunde oder mehr. Der DMA-Ring des I2S fasst 60 ms.
+
+Der Aufnahmetask legt seine Zeilen deshalb nur noch ab
+([src/nachtrag.h](src/nachtrag.h)); ausgegeben werden sie vom Sensortask auf
+Kern 0, wo Warten nichts kostet. Ein Ring mit einem Schreiber und einem Leser
+braucht dafür keine Sperre. Ist er voll, fällt die Zeile weg — eine Meldung zu
+verlieren ist harmlos, Ton zu verlieren nicht.
+
+Betroffen waren vier Stellen, und die beiden unscheinbaren waren die
+schlimmsten: die Sekundenzeile und der Stau-Melder fallen mitten in die
+Aufnahme, `Zuhören gestartet` liegt genau auf dem Tastendruck und schob damit
+das Öffnen des Mikrofons nach hinten. Gemessen nach der Umstellung, drei
+Runden:
+
+| | Taste | erwartet | aufgezeichnet | Verlust |
+|---|---:|---:|---:|---:|
+| Runde 1 | 955 ms | 895 | 880 | 15 ms |
+| Runde 2 | 1213 ms | 1033 | 960 | 73 ms |
+| Runde 3 | 1897 ms | 1717 | 1660 | 57 ms |
+
+Vorher lag der Verlust bei 300 bis 900 ms je Runde.
+
 ### Was das Gespräch zusammenhält
 
 Sechs Frage-Antwort-Wechsel gehen bei jeder Anfrage wieder mit hinaus. Das
@@ -620,15 +668,36 @@ spricht, will nicht zuhören. Die Erkennung schließt dann auch eine Sitzung,
 die noch auf ihren Endtext wartet; ohne das bliebe eine offene Verbindung
 stehen, deren Ereignisse weiterhin hereinkämen.
 
-**Die Sitzung darf langsamer sein als der Tastendruck.** Eine Erkennungssitzung
-aufzubauen dauert rund 1,9 Sekunden — 0,8 s TLS, der Rest WebSocket-Aufstieg
-und die Antwort auf `transcription_session.update`. Wer kurz nachfragt, lässt
-vorher los. Früher endete das an dieser Stelle mit `Sitzung beendet (ohne
-Sitzung)`, und die anderthalb Sekunden Aufnahme, die sauber im PSRAM lagen,
-waren weg — ohne Antwort und ohne ein Zeichen, dass überhaupt etwas angekommen
-war. Das Loslassen setzt den Abschluss jetzt nur auf *offen*; das `commit`
-geht hinaus, sobald die Sitzung steht und der letzte Frame drüben ist.
-Aufgegeben wird erst nach fünf Sekunden.
+**Die Sitzung steht, bevor jemand drückt.** Eine Erkennungssitzung aufzubauen
+dauert rund 1,9 Sekunden — 0,8 s TLS, der Rest WebSocket-Aufstieg und die
+Antwort auf `transcription_session.update`. Das kostete nicht nur Zeit, es fiel
+genau in die Aufnahme. Deshalb wird sie aufgebaut, sobald das WLAN steht, und
+bleibt über die Runden hinweg stehen: die Gegenstelle nimmt eine zweite und
+dritte Äußerung auf derselben Verbindung entgegen, der Eingangspuffer wird vor
+jeder mit `input_audio_buffer.clear` geleert. Der Endtext kommt seitdem 500 bis
+690 ms nach dem Loslassen statt nach über zwei Sekunden.
+
+**Und sie darf trotzdem langsamer sein als der Tastendruck.** Wer kurz
+nachfragt, lässt los, bevor der Aufbau durch ist. Früher endete das mit
+`Sitzung beendet (ohne Sitzung)`, und die anderthalb Sekunden Aufnahme, die
+sauber im PSRAM lagen, waren weg — ohne Antwort und ohne ein Zeichen, dass
+überhaupt etwas angekommen war. Das Loslassen setzt den Abschluss jetzt nur auf
+*offen*; das `commit` geht hinaus, sobald die Sitzung steht und der letzte Frame
+drüben ist.
+
+Dasselbe gilt, wenn die Verbindung mitten in der Aufnahme stirbt — beobachtet,
+als nebenan eine zweite TLS-Verbindung vorgewärmt wurde und der Schreibversuch
+auf dieser hier an zu wenig Speicher scheiterte:
+
+```
+E (27445) esp-tls-mbedtls: write error :-0x6C00
+W (27462) stt: WebSocket-Fehler.
+I (33131) stt: Sitzung beendet (ohne Sitzung).
+```
+
+Die Runde verschwand vollständig. Jetzt wird in diesem Fall sofort neu
+aufgebaut; die Aufnahme liegt im PSRAM und wird nachgeschickt, sobald die neue
+Sitzung steht. Die Frist dafür trägt den Neuaufbau: neun Sekunden.
 
 ## Log auf dem Display
 
@@ -678,18 +747,9 @@ der seriellen Schnittstelle stehen sie weiter.
   auf Kern 1, die Handschläge auf Kern 0 — die Kopplung dürfte über die
   Heap-Sperre laufen, die mbedTLS mit `CONFIG_MBEDTLS_DYNAMIC_BUFFER` stark
   belastet. Nicht nachgemessen.
-- **Ton, der während des Handschlags verlorengeht**: jede Aufnahme verliert
-  300 bis 900 ms, und zwar am Anfang, während die Erkennung ihre Verbindung
-  aufbaut. Gemessen an drei Runden: 2069 ms gedrückt, 1160 ms aufgezeichnet;
-  1252 gegen 940; 1715 gegen 1380. Die Lücke der ersten Runde deckt sich mit
-  zwei gemeldeten Staus von 607 und 345 ms. Der Aufnahmetask liegt auf
-  Priorität 6 über allem, was diese Firmware selbst anlegt, und steht trotzdem
-  — ob er auf Daten wartet oder nur nicht drankommt, misst gerade der
-  Wachtask. Praktisch heißt das: wer sofort nach dem Tastendruck spricht,
-  verliert den Satzanfang; wer eine Sekunde wartet, nicht.
-- **Erkennungssitzung vorwärmen**: der WebSocket wird bei jedem Tastendruck
-  neu aufgebaut und kostet 1,9 s — die größte verbliebene Einzelzeit. Chat und
-  Stimme halten ihre Verbindung stehen; für die Erkennung wäre dasselbe
-  möglich, braucht aber eine Antwort darauf, wie lange die Gegenseite eine
-  unbenutzte Transkriptionssitzung offen lässt.
+- **Wie lange die Erkennungssitzung stehen bleibt**: sie wird jetzt
+  vorgehalten, aber wie lange die Gegenseite eine unbenutzte
+  Transkriptionssitzung offen lässt, steht nicht in der Doku. Fällt sie weg,
+  baut das Gerät im Leerlauf neu auf — nachgemessen ist aber nicht, wie oft das
+  passiert und ob es je einen Tastendruck trifft.
 - **microSD und RTC**: noch nicht angebunden.

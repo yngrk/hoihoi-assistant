@@ -107,6 +107,11 @@ class Stt {
     volatile int32_t sitzung_ok_ = 0;
     volatile int32_t endtext_    = 0;
 
+    // Die Verbindung ist nicht bloss zu, sie ist gescheitert. Der Unterschied
+    // zaehlt: waehrend eines Aufbaus ist verbunden_ auch null, und ein
+    // Neuversuch mittendrin wuerde den Aufbau abwuergen.
+    volatile int32_t ws_fehler_  = 0;
+
     size_t gesendet_ = 0;      // Frames, die schon draussen sind
 
     char              text_[kMaxText] = {0};

@@ -33,6 +33,7 @@
 #include "audio.h"
 #include "listen.h"
 #include "logview.h"
+#include "nachtrag.h"
 #include "cfg.h"
 #include "net.h"
 #include "prov.h"
@@ -1007,64 +1008,46 @@ static void display_task(void *)
 // Abtastwerte kosten, im Anzeigetask ein halbes Bild.
 static void stats_task(void *)
 {
+    int64_t letzte_messung = 0;
+
     while (true) {
-        int32_t t100 = 0, h100 = 0;
-        if (shtc3_measure(&t100, &h100) == ESP_OK) {
-            env_temp_c100 = t100;
-            env_hum_100   = h100;
-            env_valid     = 1;
-        } else {
-            env_valid = 0;
+        // Zuerst das, was der Aufnahmetask abgelegt hat. Er darf nicht selbst
+        // schreiben, siehe nachtrag.h — hier auf Kern 0 kostet das Warten auf
+        // die serielle Schnittstelle niemanden Ton.
+        nachtrag::ausgeben();
+
+        const int64_t jetzt = esp_timer_get_time();
+        if (jetzt - letzte_messung >= 2000000) {
+            letzte_messung = jetzt;
+
+            int32_t t100 = 0, h100 = 0;
+            if (shtc3_measure(&t100, &h100) == ESP_OK) {
+                env_temp_c100 = t100;
+                env_hum_100   = h100;
+                env_valid     = 1;
+            } else {
+                env_valid = 0;
+            }
+
+            int raw = 0;
+            if (adc_oneshot_read(adc_handle, ADC_CHANNEL_3, &raw) == ESP_OK) {
+                battery_raw = raw;
+            }
         }
 
-        int raw = 0;
-        if (adc_oneshot_read(adc_handle, ADC_CHANNEL_3, &raw) == ESP_OK) {
-            battery_raw = raw;
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
 
 static void audio_task(void *);
-static TaskHandle_t s_audio_task = nullptr;
 
-// Der Aufnahmetask liegt auf Prioritaet 6 ueber allem, was diese Firmware
-// selbst anlegt, und steht trotzdem. Zwei Erklaerungen sind moeglich, und sie
-// fuehren zu entgegengesetzten Antworten: entweder er wartet auf Daten, die
-// der Wandler nicht liefert, oder er ist laengst bereit und kommt nur nicht
-// dran. Sich selbst beim Warten zusehen kann er nicht — also sieht ihm von
-// Kern 0 aus ein zweiter zu, der waehrenddessen nachweislich laeuft.
-static void wacht_task(void *)
-{
-    int bereit = 0, blockiert = 0;
-    while (true) {
-        const eTaskState z = (s_audio_task != nullptr)
-                                 ? eTaskGetState(s_audio_task) : eRunning;
-
-        if (z == eReady) {
-            bereit++;
-        } else {
-            if (bereit >= 12) {
-                ESP_LOGW(TAG, "Aufnahme bereit, aber nicht dran: %d ms.",
-                         bereit * 5);
-            }
-            bereit = 0;
-        }
-
-        if (z == eBlocked) {
-            blockiert++;
-        } else {
-            if (blockiert >= 12) {
-                ESP_LOGW(TAG, "Aufnahme wartet auf Ton: %d ms.", blockiert * 5);
-            }
-            blockiert = 0;
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(5));
-    }
-}
+// Nachgemessen und damit erledigt: der Aufnahmetask wird nie verdraengt. Ein
+// Wachtask auf Kern 0 hat ueber zwei Runden kein einziges Mal gesehen, dass er
+// bereit war und nicht drankam — wenn er steht, wartet er auf Ton, der nicht
+// kommt. An den Prioritaeten liegt es also nicht. Der Handschlag, der die
+// Luecke verursacht, faellt seit dem Vorhalten der Sitzung nicht mehr in die
+// Aufnahme.
 
 // --- Stau-Melder ----------------------------------------------------------
 //
@@ -1111,8 +1094,8 @@ static void stau_melden(int luecke_ms, int vor_ms, int lesen_ms, int nach_ms)
         p += snprintf(&zeile[p], sizeof(zeile) - p, " %s=%d",
                       jetzt[i].pcTaskName, (int)delta);
     }
-    ESP_LOGW(TAG, "Stau %d ms (davor %d, lesen %d, danach %d):%s",
-             luecke_ms, vor_ms, lesen_ms, nach_ms, zeile);
+    nachtrag::schreiben('W', TAG, "Stau %d ms (davor %d, lesen %d, danach %d):%s",
+                        luecke_ms, vor_ms, lesen_ms, nach_ms, zeile);
 }
 
 // Richtet alles ein, was zum Aufnehmen, Erkennen, Antworten und Sprechen
@@ -1189,7 +1172,6 @@ static bool visualize_mic(void)
     // das Mikrofon so lange warten, wie er selbst wartet. Gerechnet wird hier
     // nichts; die zwanzig Millisekunden einer Messung sind vTaskDelay.
     xTaskCreatePinnedToCore(stats_task, "stats", 3072, nullptr, 6, nullptr, 0);
-    xTaskCreatePinnedToCore(wacht_task, "wacht", 3072, nullptr, 7, nullptr, 0);
 
     // Der Lautsprecher bleibt, die Wiedergabe der eigenen Aufnahme nicht.
     // Sie war ein Diagnosemittel fuer die Aufnahmequalitaet, und die ist
@@ -1231,8 +1213,8 @@ static bool visualize_mic(void)
     // muessen. Kern 1 hat ausser der Anzeige nichts zu tun, und dort steht
     // der Aufnahmetakt ueber ihr: ein ausgelassenes Bild faellt nicht auf,
     // eine verlorene Silbe schon.
-    if (xTaskCreatePinnedToCore(audio_task, "audio", 4096, nullptr, 6,
-                                &s_audio_task, 1) != pdPASS) {
+    if (xTaskCreatePinnedToCore(audio_task, "audio", 4096, nullptr, 6, nullptr, 1)
+            != pdPASS) {
         ESP_LOGE(TAG, "  Aufnahmetask konnte nicht angelegt werden.");
         return false;
     }
@@ -1295,8 +1277,9 @@ static void audio_task(void *)
             // der Lautsprecher gibt den Port nicht her; wenige Runden bei
             // langer Zeit heisst, dieser Task kam nicht dran.
             if (wartems > 20) {
-                ESP_LOGW(TAG, "  Uebergabe an das Mikrofon: %d ms in %d Runden.",
-                         wartems, runden);
+                nachtrag::schreiben('W', TAG,
+                                    "  Uebergabe an das Mikrofon: %d ms in %d Runden.",
+                                    wartems, runden);
             }
         } else if (!listener.listening() && mic.running()) {
             mic.stop();
@@ -1324,7 +1307,7 @@ static void audio_task(void *)
             vTaskDelay(pdMS_TO_TICKS(20));
             t_c = esp_timer_get_time();
         } else if (mic.read_mono(block, kReadFrames) != ESP_OK) {
-            ESP_LOGW(TAG, "  Lesefehler, naechster Versuch.");
+            nachtrag::schreiben('W', TAG, "  Lesefehler, naechster Versuch.");
             vTaskDelay(pdMS_TO_TICKS(20));
             t_c = esp_timer_get_time();
         } else {
@@ -1394,7 +1377,7 @@ static void audio_task(void *)
             const int raw = (int)battery_raw;   // gemessen im stats_task
             const int32_t fc = frame_count;
             frames_per_s = fc;                  // fuer das Stats-Band
-            ESP_LOGI(TAG,
+            nachtrag::schreiben('I', TAG,
                      "Pegel rms=%5d (%.1f dBFS)  peak=%5d  Skala=%5d  |  "
                      "Bild %d/%d ms, %d/s  |  TE %d us (%d Hz, %d Timeouts, DMA %d)"
                      "  |  MIK=%s BOOT=%s KEY=%s  Batterie=%d",

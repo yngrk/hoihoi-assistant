@@ -33,7 +33,12 @@ static const int64_t kFinalWaitUs = 8 * 1000000;
 // WebSocket-Aufstieg und die Antwort auf transcription_session.update. Wer
 // kurz drueckt, laesst frueher los als das; die Aufnahme liegt dann
 // vollstaendig im PSRAM und wird nachgereicht, statt weggeworfen zu werden.
-static const int64_t kSitzungWarteUs = 5 * 1000000;
+static const int64_t kSitzungWarteUs = 9 * 1000000;
+
+// Nach einem gescheiterten oder verlorenen Aufbau nicht sofort wieder
+// anklopfen. Ein falscher Schluessel soll nicht im Sekundentakt gegen die
+// Gegenstelle laufen.
+static const int64_t kAufbauPauseUs = 10 * 1000000;
 
 esp_err_t Stt::begin(Listener *quelle, uint32_t sample_rate,
                      const char *key, const char *model, const char *language)
@@ -151,10 +156,12 @@ void Stt::ws_event(void *args, esp_event_base_t, int32_t id, void *event_data)
         case WEBSOCKET_EVENT_CLOSED:
             self->verbunden_  = 0;
             self->sitzung_ok_ = 0;
+            self->ws_fehler_  = 1;
             break;
 
         case WEBSOCKET_EVENT_ERROR:
             ESP_LOGW(TAG, "WebSocket-Fehler.");
+            self->ws_fehler_ = 1;
             break;
 
         case WEBSOCKET_EVENT_DATA:
@@ -301,6 +308,7 @@ esp_err_t Stt::open_session()
     verbunden_  = 0;
     sitzung_ok_ = 0;
     endtext_    = 0;
+    ws_fehler_  = 0;
 
     return esp_websocket_client_start((esp_websocket_client_handle_t)client_);
 }
@@ -316,6 +324,7 @@ void Stt::close_session(const char *grund)
     client_     = nullptr;
     verbunden_  = 0;
     sitzung_ok_ = 0;
+    ws_fehler_  = 0;
 }
 
 // --- Ablauf ---------------------------------------------------------------
@@ -330,28 +339,100 @@ void Stt::run()
     bool    abschluss_offen = false;
     int64_t abschluss_frist = 0;
 
+    // Fruehestens dann wieder aufbauen, und seit wann der laufende Aufbau
+    // laeuft.
+    int64_t naechster_aufbau = 0;
+    int64_t aufbau_seit      = 0;
+
     while (true) {
         const bool aktiv = quelle_->listening();
 
-        // --- Tastendruck: Verbindung aufbauen ---
+        // --- Die Sitzung vorhalten ---
+        //
+        // Der Aufbau kostet 1,9 s, und er kostete bisher mehr als Zeit: er
+        // fiel genau in die Aufnahme. Gemessen ueber drei Runden verlor jede
+        // 300 bis 900 ms Ton, immer am Anfang, immer waehrend des
+        // TLS-Handschlags — wer sofort nach dem Tastendruck sprach, verlor
+        // den Satzanfang. Am Aufnahmetask lag es nicht: der wird nie
+        // verdraengt, er bekam schlicht keine Daten.
+        //
+        // Deshalb steht die Sitzung, bevor jemand drueckt, und sie bleibt
+        // ueber die Runden hinweg stehen. Faellt sie weg, wird sie hier neu
+        // aufgebaut — im Leerlauf, wo es niemanden kostet.
+        if (!aktiv && client_ == nullptr && net::connected()
+            && phase_ != (int32_t)Phase::Fehler
+            && esp_timer_get_time() >= naechster_aufbau) {
+            konfiguriert = false;
+            if (open_session() == ESP_OK) {
+                aufbau_seit = esp_timer_get_time();
+            } else {
+                naechster_aufbau = esp_timer_get_time() + kAufbauPauseUs;
+            }
+        }
+
+        if (sitzung_ok_ && aufbau_seit != 0) {
+            ESP_LOGI(TAG, "Sitzung steht nach %d ms und bleibt stehen.",
+                     (int)((esp_timer_get_time() - aufbau_seit) / 1000));
+            aufbau_seit = 0;
+        }
+
+        // --- Tastendruck ---
         if (aktiv && !war_aktiv) {
             gesendet_       = 0;
-            konfiguriert    = false;
             abschluss_offen = false;
+            endtext_        = 0;
             set_text("");
 
-            // Wer sofort nachfragt, drueckt die Taste, bevor die vorige
-            // Sitzung ihren Endtext hatte. Ohne diese Zeile ueberschriebe
-            // open_session() den alten Griff und liesse eine Sitzung offen,
-            // deren Ereignisse weiterhin hier hereinkaemen.
-            if (client_ != nullptr) close_session("ueberholt");
-
-            if (!net::connected()) {
-                phase_ = (int32_t)Phase::Aus;
-            } else if (open_session() == ESP_OK) {
-                phase_ = (int32_t)Phase::Verbindet;
+            if (client_ != nullptr && verbunden_ && sitzung_ok_) {
+                // Der Normalfall: es ist nichts aufzubauen. Nur den
+                // Eingangspuffer der Gegenseite leeren, falls von einer
+                // abgebrochenen Runde noch etwas darin liegt.
+                send_json("{\"type\":\"input_audio_buffer.clear\"}");
+                konfiguriert = true;
+                phase_       = (int32_t)Phase::Hoert;
             } else {
-                phase_ = (int32_t)Phase::Fehler;
+                konfiguriert = false;
+
+                // Wer sofort nachfragt, drueckt die Taste, bevor die vorige
+                // Sitzung ihren Endtext hatte. Ohne diese Zeile ueberschriebe
+                // open_session() den alten Griff und liesse eine Sitzung
+                // offen, deren Ereignisse weiterhin hier hereinkaemen.
+                if (client_ != nullptr) close_session("ueberholt");
+
+                if (!net::connected()) {
+                    phase_ = (int32_t)Phase::Aus;
+                } else if (open_session() == ESP_OK) {
+                    aufbau_seit = esp_timer_get_time();
+                    phase_      = (int32_t)Phase::Verbindet;
+                } else {
+                    phase_ = (int32_t)Phase::Fehler;
+                }
+            }
+        }
+
+        // --- Stirbt die Sitzung mitten in der Aufnahme, sofort neu ---
+        //
+        // Die Aufnahme ist dabei nicht verloren: sie liegt vollstaendig im
+        // PSRAM. Frueher lief in diesem Fall die Frist von fuenf Sekunden ab,
+        // ohne dass jemand eine neue Sitzung aufgebaut haette, und die ganze
+        // Aeusserung verschwand — ohne Antwort und ohne ein Zeichen, dass
+        // ueberhaupt etwas angekommen war. Beobachtet, als nebenan eine
+        // zweite TLS-Verbindung vorgewaermt wurde und der Schreibversuch auf
+        // dieser hier an zu wenig Speicher scheiterte.
+        //
+        // Der Neuaufbau kostet 1,9 s und passt damit in die Frist; der
+        // Nachschub-Block darunter holt den Rueckstand auf, sobald die neue
+        // Sitzung steht.
+        if ((aktiv || abschluss_offen) && client_ != nullptr && ws_fehler_) {
+            close_session("Verbindung weg, neuer Versuch");
+            konfiguriert = false;
+            gesendet_    = 0;   // die neue Sitzung kennt nichts von vorher
+            if (net::connected() && open_session() == ESP_OK) {
+                aufbau_seit = esp_timer_get_time();
+                phase_      = (int32_t)Phase::Verbindet;
+            } else {
+                naechster_aufbau = esp_timer_get_time() + kAufbauPauseUs;
+                phase_           = (int32_t)Phase::Fehler;
             }
         }
 
@@ -364,7 +445,7 @@ void Stt::run()
         // Waehrend des Verbindungsaufbaus laeuft die Aufnahme schon. Der
         // Listener haelt alles im PSRAM, also geht nichts verloren: sobald
         // die Sitzung steht, wird der Rueckstand aufgeholt.
-        if (client_ != nullptr && sitzung_ok_) {
+        if (client_ != nullptr && sitzung_ok_ && (aktiv || abschluss_offen)) {
             if (phase_ == (int32_t)Phase::Verbindet) phase_ = (int32_t)Phase::Hoert;
 
             const int16_t *pcm  = quelle_->samples();
@@ -412,17 +493,23 @@ void Stt::run()
             } else if (client_ == nullptr
                        || esp_timer_get_time() > abschluss_frist) {
                 close_session("ohne Sitzung");
-                phase_          = (int32_t)Phase::Bereit;
-                abschluss_offen = false;
+                naechster_aufbau = esp_timer_get_time() + kAufbauPauseUs;
+                phase_           = (int32_t)Phase::Bereit;
+                abschluss_offen  = false;
             }
         }
 
         // --- Endtext abwarten ---
         if (phase_ == (int32_t)Phase::Wartet) {
             const bool zu_lang = (esp_timer_get_time() - warte_seit) > kFinalWaitUs;
-            if (endtext_ || zu_lang || !verbunden_) {
-                close_session(endtext_ ? "fertig" : "Zeit abgelaufen");
+            if (endtext_) {
+                // Nicht schliessen. Die Sitzung nimmt die naechste Aeusserung
+                // auf derselben Verbindung an, und genau darum geht es.
                 phase_ = (int32_t)Phase::Bereit;
+            } else if (zu_lang || !verbunden_) {
+                close_session(zu_lang ? "Zeit abgelaufen" : "Verbindung weg");
+                naechster_aufbau = esp_timer_get_time() + kAufbauPauseUs;
+                phase_           = (int32_t)Phase::Bereit;
             }
         }
 

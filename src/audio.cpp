@@ -1,5 +1,7 @@
 #include "audio.h"
 
+#include "nachtrag.h"
+
 #include <string.h>
 
 #include <esp_heap_caps.h>
@@ -218,7 +220,8 @@ esp_err_t MicInput::start()
     peak_l_  = 0;
     peak_r_  = 0;
 
-    ESP_LOGI(TAG, "Mikrofon an (%d ms Port frei, %d ms oeffnen, %.1f dB).",
+    nachtrag::schreiben('I', TAG,
+             "Mikrofon an (%d ms Port frei, %d ms oeffnen, %.1f dB).",
              (int)((t1 - t0) / 1000),
              (int)((esp_timer_get_time() - t1) / 1000), gain_db_);
     return ESP_OK;
