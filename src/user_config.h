@@ -15,7 +15,7 @@
 #define RLCD_SCK_PIN    GPIO_NUM_11
 #define RLCD_MOSI_PIN   GPIO_NUM_12
 #define RLCD_RST_PIN    GPIO_NUM_41
-#define RLCD_TE_PIN     GPIO_NUM_6    // Tearing-Effect, vom Treiber nicht genutzt
+#define RLCD_TE_PIN     GPIO_NUM_6    // Tearing-Effect, ausgewertet in Canvas (gfx.h)
 
 // I2C: SHTC3 (0x70), PCF85063 RTC (0x51), ES8311 Codec (0x18), ES7210 ADC (0x40)
 #define I2C_SDA_PIN     GPIO_NUM_13

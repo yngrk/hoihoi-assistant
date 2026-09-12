@@ -203,6 +203,16 @@ static void test_display(void)
     // RLCD_SetPixel() — siehe gfx.h zur Begruendung.
     display = new Canvas(rlcd, LCD_WIDTH, LCD_HEIGHT);
 
+    // RLCD_Init() hat die TE-Leitung des Controllers bereits eingeschaltet
+    // (Befehl 0x35 mit Parameter 0x00), ausgewertet hat sie bisher niemand.
+    const esp_err_t te = display->enable_tearing_sync(RLCD_TE_PIN);
+    if (te == ESP_OK) {
+        ESP_LOGI(TAG, "  TE-Synchronisation aktiv (GPIO%d).", RLCD_TE_PIN);
+    } else {
+        ESP_LOGW(TAG, "  TE-Synchronisation nicht moeglich (%s), Bild kann reissen.",
+                 esp_err_to_name(te));
+    }
+
     display->clear(ColorWhite);
     display->flush();
     vTaskDelay(pdMS_TO_TICKS(500));
@@ -284,6 +294,14 @@ static void init_inputs(void)
 }
 
 // --- 6. Mikrofon-Visualisierung -------------------------------------------
+//
+// Bildausgabe und Audioaufnahme laufen in getrennten Tasks, und das ist keine
+// Stilfrage. Das Panel gibt ueber die TE-Leitung 27,03 Hz vor (gemessen:
+// 36990 us, sehr stabil). Waren beide aneinandergekoppelt, lag die Bildrate auf
+// dem Audiotakt von 25 Hz — und zwei fast gleiche Frequenzen ergeben eine
+// Schwebung von gut 2 Hz, die als regelmaessiges Stottern sichtbar wird.
+// Entkoppelt laeuft die Anzeige exakt auf der Panelfrequenz und die Aufnahme in
+// ihrem eigenen Takt, ohne dass eine die andere zieht.
 
 static MicInput mic;
 
@@ -301,12 +319,14 @@ static const int kMeterBottom = 295;
 static const int kFramesPerColumn = 40;
 static const int kColumnsPerRead  = 8;
 static const int kReadFrames      = kFramesPerColumn * kColumnsPerRead;   // 320 = 20 ms
-static const int kReadsPerFrame   = 2;                                    // neu zeichnen alle 40 ms (25 Bilder/s)
 
-// Ringpuffer der Huellkurve, eine Spalte je Bildspalte.
-static int16_t col_min[LCD_WIDTH];
-static int16_t col_max[LCD_WIDTH];
-static int     col_head = 0;   // aelteste Spalte, also der linke Bildrand
+// Geteilter Zustand zwischen Aufnahme- und Anzeigetask.
+static SemaphoreHandle_t scope_lock = nullptr;
+static int16_t           col_min[LCD_WIDTH];
+static int16_t           col_max[LCD_WIDTH];
+static int               col_head = 0;      // aelteste Spalte, also linker Rand
+static int32_t           shared_rms = 0;
+static int32_t           shared_peak = 0;
 
 // Die Empfindlichkeit der Mikrofone ist nicht dokumentiert, ein fester Faktor
 // wuerde also entweder in Stille das Grundrauschen aufblasen oder bei Sprache
@@ -316,9 +336,14 @@ static int     col_head = 0;   // aelteste Spalte, also der linke Bildrand
 static const int32_t kScaleFloor = 1200;
 static int32_t       scope_scale = kScaleFloor;
 
-static int sample_to_y(int32_t s)
+// Kennzahlen der Anzeige, nur fuer die Logzeile.
+static volatile int32_t frame_us_sum = 0;
+static volatile int32_t frame_us_max = 0;
+static volatile int32_t frame_count  = 0;
+
+static int sample_to_y(int32_t s, int32_t scale)
 {
-    return kScopeCenter - (int)((s * kScopeHalf) / scope_scale);
+    return kScopeCenter - (int)((s * kScopeHalf) / scale);
 }
 
 // Pegel logarithmisch: linear waere Sprache bei 16 Bit ein kaum sichtbarer
@@ -332,7 +357,8 @@ static int level_to_width(int32_t amplitude)
     return (int)((db + 60.0f) / 60.0f * (LCD_WIDTH - 4));
 }
 
-static void draw_scope(int32_t rms, int32_t peak)
+static void draw_scope(const int16_t *lo, const int16_t *hi, int head,
+                       int32_t scale, int32_t rms, int32_t peak)
 {
     display->clear(ColorWhite);
 
@@ -343,9 +369,9 @@ static void draw_scope(int32_t rms, int32_t peak)
 
     // Aelteste Spalte links, neueste rechts — das Bild laeuft nach links weg.
     for (int i = 0; i < LCD_WIDTH; i++) {
-        const int idx = (col_head + i) % LCD_WIDTH;
-        const int y0  = sample_to_y(col_max[idx]);
-        const int y1  = sample_to_y(col_min[idx]);
+        const int idx = (head + i) % LCD_WIDTH;
+        const int y0  = sample_to_y(hi[idx], scale);
+        const int y1  = sample_to_y(lo[idx], scale);
         if (y0 == y1) {
             display->pixel(i, y0, ColorBlack);
         } else {
@@ -365,7 +391,38 @@ static void draw_scope(int32_t rms, int32_t peak)
         display->vline(2 + p - 1, kMeterTop + 1, kMeterBottom - 1, ColorBlack);
     }
 
-    display->flush();
+    display->flush();   // wartet auf die naechste Austastluecke
+}
+
+// Anzeigetask: taktet sich ueber flush() selbst auf die Panelfrequenz. Er
+// arbeitet auf einer Kopie, damit der Aufnahmetask waehrend des Zeichnens
+// weiterschreiben kann.
+static void display_task(void *)
+{
+    static int16_t lo[LCD_WIDTH];
+    static int16_t hi[LCD_WIDTH];
+
+    while (true) {
+        int     head;
+        int32_t scale, rms, peak;
+
+        xSemaphoreTake(scope_lock, portMAX_DELAY);
+        memcpy(lo, col_min, sizeof(lo));
+        memcpy(hi, col_max, sizeof(hi));
+        head  = col_head;
+        scale = scope_scale;
+        rms   = shared_rms;
+        peak  = shared_peak;
+        xSemaphoreGive(scope_lock);
+
+        const int64_t t0 = esp_timer_get_time();
+        draw_scope(lo, hi, head, scale, rms, peak);
+        const int32_t dt = (int32_t)(esp_timer_get_time() - t0);
+
+        if (dt > frame_us_max) frame_us_max = dt;
+        frame_us_sum += dt;
+        frame_count++;
+    }
 }
 
 static void visualize_mic(void)
@@ -377,25 +434,28 @@ static void visualize_mic(void)
         return;
     }
 
-    static int16_t block[kReadFrames];
     memset(col_min, 0, sizeof(col_min));
     memset(col_max, 0, sizeof(col_max));
+
+    scope_lock = xSemaphoreCreateMutex();
+    if (scope_lock == nullptr) {
+        ESP_LOGE(TAG, "  Mutex konnte nicht angelegt werden.");
+        return;
+    }
 
     ESP_LOGI(TAG, "  %d Hz, %d Frames je Spalte, %d Spalten = %.1f s Bildbreite.",
              (int)mic.sample_rate(), kFramesPerColumn, LCD_WIDTH,
              (float)LCD_WIDTH * kFramesPerColumn / mic.sample_rate());
 
-    int     reads      = 0;
-    int64_t sum_sq     = 0;      // fuer den Effektivwert ueber eine Sekunde
-    int32_t sum_count  = 0;
-    int32_t window_pk  = 0;
-    int64_t last_log   = esp_timer_get_time();
+    // Anzeige auf den zweiten Kern, damit das Zeichnen die Aufnahme nicht
+    // verdraengt und umgekehrt.
+    xTaskCreatePinnedToCore(display_task, "display", 4096, nullptr, 4, nullptr, 1);
 
-    // Zeichendauer mitmessen: bleibt sie ueber kReadsPerFrame * 20 ms, laeuft
-    // der I2S-Puffer ueber und das Bild bekommt Luecken in der Zeitachse.
-    int64_t draw_us_sum = 0;
-    int32_t draw_us_max = 0;
-    int32_t draw_count  = 0;
+    static int16_t block[kReadFrames];
+    int64_t        sum_sq    = 0;
+    int32_t        sum_count = 0;
+    int32_t        window_pk = 0;
+    int64_t        last_log  = esp_timer_get_time();
 
     while (true) {
         if (mic.read_mono(block, kReadFrames) != ESP_OK) {
@@ -404,14 +464,17 @@ static void visualize_mic(void)
             continue;
         }
 
+        int16_t lo[kColumnsPerRead];
+        int16_t hi[kColumnsPerRead];
         int32_t block_peak = 0;
+
         for (int c = 0; c < kColumnsPerRead; c++) {
-            int16_t lo = INT16_MAX;
-            int16_t hi = INT16_MIN;
+            int16_t cl = INT16_MAX;
+            int16_t ch = INT16_MIN;
             for (int k = 0; k < kFramesPerColumn; k++) {
                 const int16_t s = block[c * kFramesPerColumn + k];
-                if (s < lo) lo = s;
-                if (s > hi) hi = s;
+                if (s < cl) cl = s;
+                if (s > ch) ch = s;
 
                 const int32_t a = (s < 0) ? -(int32_t)s : (int32_t)s;
                 if (a > block_peak) block_peak = a;
@@ -419,11 +482,20 @@ static void visualize_mic(void)
                 sum_sq += (int64_t)s * s;
                 sum_count++;
             }
-            col_min[col_head] = lo;
-            col_max[col_head] = hi;
-            col_head = (col_head + 1) % LCD_WIDTH;
+            lo[c] = cl;
+            hi[c] = ch;
         }
 
+        const int32_t rms = (sum_count > 0)
+                                ? (int32_t)sqrt((double)(sum_sq / sum_count))
+                                : 0;
+
+        xSemaphoreTake(scope_lock, portMAX_DELAY);
+        for (int c = 0; c < kColumnsPerRead; c++) {
+            col_min[col_head] = lo[c];
+            col_max[col_head] = hi[c];
+            col_head = (col_head + 1) % LCD_WIDTH;
+        }
         // Vollausschlag nachfuehren: sofort auf, langsam zu.
         if (block_peak > scope_scale) {
             scope_scale = block_peak;
@@ -431,46 +503,39 @@ static void visualize_mic(void)
             scope_scale -= (scope_scale - kScaleFloor) / 24;
         }
         if (scope_scale < kScaleFloor) scope_scale = kScaleFloor;
-
-        if (++reads >= kReadsPerFrame) {
-            reads = 0;
-            const int32_t rms = (sum_count > 0)
-                                    ? (int32_t)sqrt((double)(sum_sq / sum_count))
-                                    : 0;
-            const int64_t t0 = esp_timer_get_time();
-            draw_scope(rms, window_pk);
-            const int32_t dt = (int32_t)(esp_timer_get_time() - t0);
-            if (dt > draw_us_max) draw_us_max = dt;
-            draw_us_sum += dt;
-            draw_count++;
-        }
+        shared_rms  = rms;
+        shared_peak = window_pk;
+        xSemaphoreGive(scope_lock);
 
         // Einmal pro Sekunde eine Zeile ins Log, mit Tasten und Batterie.
         const int64_t now = esp_timer_get_time();
         if (now - last_log >= 1000000) {
             last_log = now;
-            const int32_t rms = (sum_count > 0)
-                                    ? (int32_t)sqrt((double)(sum_sq / sum_count))
-                                    : 0;
             int raw = 0;
             adc_oneshot_read(adc_handle, ADC_CHANNEL_3, &raw);
+            const int32_t fc = frame_count;
             ESP_LOGI(TAG,
                      "Pegel rms=%5d (%.1f dBFS)  peak=%5d  Skala=%5d  |  "
-                     "Zeichnen %d/%d ms von %d  |  BOOT=%s KEY=%s  Batterie=%d",
+                     "Bild %d/%d ms, %d/s  |  TE %d us (%d Hz, %d Timeouts)"
+                     "  |  BOOT=%s KEY=%s  Batterie=%d",
                      (int)rms, 20.0f * log10f(((float)rms + 1.0f) / 32768.0f),
                      (int)window_pk, (int)scope_scale,
-                     (int)(draw_count ? (draw_us_sum / draw_count / 1000) : 0),
-                     (int)(draw_us_max / 1000),
-                     kReadsPerFrame * kReadFrames * 1000 / 16000,
+                     (int)(fc ? (frame_us_sum / fc / 1000) : 0),
+                     (int)(frame_us_max / 1000), (int)fc,
+                     (int)display->te_period_us(),
+                     (int)(display->te_period_us()
+                               ? 1000000 / display->te_period_us()
+                               : 0),
+                     (int)display->te_timeouts(),
                      gpio_get_level(BOOT_BUTTON_PIN) ? "offen" : "GEDRUECKT",
                      gpio_get_level(KEY_BUTTON_PIN) ? "offen" : "GEDRUECKT",
                      raw);
-            sum_sq      = 0;
-            sum_count   = 0;
-            window_pk   = 0;
-            draw_us_sum = 0;
-            draw_us_max = 0;
-            draw_count  = 0;
+            sum_sq       = 0;
+            sum_count    = 0;
+            window_pk    = 0;
+            frame_us_sum = 0;
+            frame_us_max = 0;
+            frame_count  = 0;
         }
     }
 }

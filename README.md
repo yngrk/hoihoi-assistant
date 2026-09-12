@@ -115,7 +115,23 @@ ist deutlich verlässlicher, als die Werte selbst herzuleiten.
 
 16 kHz, 16 Bit, beide Kanäle zu Mono gemittelt. 40 Frames je Bildspalte mal 400
 Spalten ergeben genau eine Sekunde Signal über die volle Breite; das Bild läuft
-nach links weg und wird alle 40 ms neu gezeichnet.
+nach links weg.
+
+Aufnahme und Anzeige laufen in **getrennten Tasks**, und das ist keine
+Stilfrage. Das Panel gibt über die TE-Leitung 27,03 Hz vor (gemessen: 36990 µs,
+sehr stabil). Waren beide aneinandergekoppelt, lag die Bildrate auf dem
+Audiotakt von 25 Hz — zwei fast gleiche Frequenzen ergeben eine Schwebung von
+gut 2 Hz, sichtbar als regelmäßiges Stottern. Entkoppelt taktet sich die
+Anzeige über die TE-Leitung selbst auf die Panelfrequenz, die Aufnahme läuft in
+ihrem eigenen Takt, und keine zieht die andere.
+
+Die TE-Synchronisation steckt in `Canvas` ([src/gfx.h](src/gfx.h)), nicht im
+Treiber. `RLCD_Init()` schaltet die Leitung bereits ein (Befehl `0x35` mit
+Parameter `0x00`), ausgewertet hat sie bisher niemand: `RLCD_Sendbuffera()`
+schickt den Puffer über `esp_lcd_panel_io_tx_color` **asynchron** per DMA los,
+der Transfer von 15000 Byte bei 10 MHz dauert rund 12 ms und landete ohne
+Synchronisation quer über dem Bildaufbau des Panels — das wanderte von Bild zu
+Bild und war als Tearing sichtbar.
 
 Der Vollausschlag skaliert automatisch — sofort auf, langsam wieder zu, nie
 unter einen Sockelwert. Die Empfindlichkeit der Mikrofone ist nicht
@@ -123,8 +139,9 @@ dokumentiert, ein fester Faktor würde also entweder in Stille das Grundrauschen
 aufblasen oder bei Sprache am Anschlag kleben.
 
 Auf der Hardware gemessen: Grundrauschen bei −63 dBFS, Raumgeräusch um
-−40 dBFS, laute Sprache −21 dBFS — über 40 dB nutzbarer Dynamikumfang. Ein
-Bildaufbau kostet 3–5 ms bei einem Budget von 40 ms.
+−40 dBFS, laute Sprache −21 dBFS — über 40 dB nutzbarer Dynamikumfang. Das
+Zeichnen selbst kostet rund 4 ms, der Rest der 37 ms ist gewolltes Warten auf
+die Austastlücke.
 
 ## Offene Punkte
 

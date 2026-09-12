@@ -1,5 +1,8 @@
 #include "gfx.h"
 
+#include <esp_attr.h>
+#include <esp_timer.h>
+
 Canvas::Canvas(DisplayPort &display, int width, int height)
     : d_(display), width_(width), height_(height)
 {
@@ -10,8 +13,65 @@ void Canvas::clear(uint8_t color)
     d_.RLCD_ColorClear(color);
 }
 
+void IRAM_ATTR Canvas::te_isr(void *arg)
+{
+    Canvas       *self = (Canvas *)arg;
+    const int64_t now  = esp_timer_get_time();
+
+    if (self->te_last_us_ != 0) {
+        self->te_period_us_ = (uint32_t)(now - self->te_last_us_);
+    }
+    self->te_last_us_ = now;
+
+    BaseType_t woken = pdFALSE;
+    xSemaphoreGiveFromISR(self->te_sem_, &woken);
+    if (woken == pdTRUE) {
+        portYIELD_FROM_ISR();
+    }
+}
+
+esp_err_t Canvas::enable_tearing_sync(int te_gpio)
+{
+    te_sem_ = xSemaphoreCreateBinary();
+    if (te_sem_ == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    gpio_config_t io = {};
+    io.pin_bit_mask = (1ULL << te_gpio);
+    io.mode         = GPIO_MODE_INPUT;
+    io.pull_up_en   = GPIO_PULLUP_DISABLE;
+    io.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    io.intr_type    = GPIO_INTR_POSEDGE;
+
+    esp_err_t err = gpio_config(&io);
+    if (err != ESP_OK) return err;
+
+    // Der Dienst kann bereits laufen, wenn ihn jemand anders installiert hat —
+    // das ist kein Fehler.
+    err = gpio_install_isr_service(0);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) return err;
+
+    err = gpio_isr_handler_add((gpio_num_t)te_gpio, te_isr, this);
+    if (err != ESP_OK) return err;
+
+    te_gpio_ = te_gpio;
+    return ESP_OK;
+}
+
 void Canvas::flush()
 {
+    if (te_sem_ != nullptr) {
+        // Eine eventuell schon anstehende Flanke verwerfen, sonst wuerde auf
+        // ein Ereignis synchronisiert, das beim Zeichnen bereits vorbei war.
+        xSemaphoreTake(te_sem_, 0);
+
+        // Mit Zeitschranke: faellt das Signal aus, soll die Anzeige langsamer
+        // werden, nicht stehen bleiben.
+        if (xSemaphoreTake(te_sem_, pdMS_TO_TICKS(100)) != pdTRUE) {
+            te_timeouts_++;
+        }
+    }
     d_.RLCD_Display();
 }
 
