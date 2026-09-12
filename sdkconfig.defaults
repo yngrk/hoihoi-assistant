@@ -29,3 +29,11 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 # Audioverarbeitung (Mikrofon, Keyword-Erkennung) ist er es nicht.
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240
+
+# --- Bluetooth LE, ausschliesslich fuer die WLAN-Bereitstellung ---
+# NimBLE statt Bluedroid: deutlich kleiner, und mehr als GATT braucht der
+# Bereitstellungsdienst nicht. Klassisches Bluetooth kann der S3 ohnehin
+# nicht. Der Stack wird nach getaner Arbeit wieder freigegeben.
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_BLUEDROID_ENABLED=n

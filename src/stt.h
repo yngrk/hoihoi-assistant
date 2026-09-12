@@ -66,6 +66,17 @@ class Stt {
     // WebSocket-Task waechst, waehrend der Anzeigetask ihn zeichnet.
     void copy_text(char *out, size_t n) const;
 
+    // Zaehlt jede fertige Aeusserung hoch. Wer darauf wartet — der Chat —
+    // fragt den Zaehler ab, statt sich einen Rueckruf geben zu lassen: ein
+    // Rueckruf liefe im WebSocket-Task, und der soll nichts tun ausser
+    // Nachrichten annehmen.
+    uint32_t final_seq() const { return (uint32_t)final_seq_; }
+
+    // Der Endtext der letzten Aeusserung. Eigene Kopie, weil die naechste
+    // Aufnahme text_ wieder ueberschreibt, final_ aber stehen bleibt, bis
+    // tatsaechlich eine neue Aeusserung fertig ist.
+    void copy_final(char *out, size_t n) const;
+
   private:
     static void task_trampolin(void *self);
     static void ws_event(void *handler_args, esp_event_base_t base,
@@ -100,6 +111,8 @@ class Stt {
 
     char              text_[kMaxText] = {0};
     size_t            text_len_       = 0;
+    char              final_[kMaxText] = {0};
+    volatile int32_t  final_seq_       = 0;
     SemaphoreHandle_t text_lock_      = nullptr;
 
     // Arbeitspuffer fuer eine Sendung: Rohton, Base64 und die JSON-Huelle.

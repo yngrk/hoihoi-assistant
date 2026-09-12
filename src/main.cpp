@@ -29,12 +29,31 @@
 #include "display_bsp.h"
 #include "display_sync.h"
 #include "gfx.h"
+#include "font5x7.h"
 #include "audio.h"
 #include "listen.h"
+#include "logview.h"
+#include "cfg.h"
 #include "net.h"
+#include "prov.h"
 #include "secrets.h"
 #include "stt.h"
+#include "chat.h"
+#include "tts.h"
 #include "user_config.h"
+
+// Aeltere secrets.h kennen die Zeile noch nicht. Ein fehlendes Modell ist
+// kein Grund, den Bau scheitern zu lassen — der Standardwert ist derselbe,
+// der in der Vorlage steht.
+#ifndef CHAT_MODEL
+#define CHAT_MODEL "gpt-4o-mini"
+#endif
+#ifndef TTS_MODEL
+#define TTS_MODEL "gpt-4o-mini-tts"
+#endif
+#ifndef TTS_VOICE
+#define TTS_VOICE "alloy"
+#endif
 
 static const char *TAG = "bringup";
 
@@ -50,13 +69,9 @@ static Listener listener;
 
 // Spracherkennung. Haengt am Listener und arbeitet in einem eigenen Task,
 // der Anzeigetask liest nur Phase und Text.
-static Stt stt;
-
-// Wiedergabe der letzten Aufnahme. Zustand fuer die Anzeige, wie ueberall
-// hier in ausgerichteten 32-Bit-Worten ohne Mutex.
-static volatile int32_t play_active   = 0;
-static volatile int32_t play_ms       = 0;
-static volatile int32_t play_total_ms = 0;
+static Stt  stt;
+static Chat chat;
+static Tts  tts;
 
 // Erwartete Teilnehmer am I2C-Bus, fuer eine lesbare Scan-Ausgabe.
 struct KnownDevice {
@@ -396,6 +411,36 @@ static const int kTextLines  = (kStatsBottom - kTextY) / kTextStep;   // 8
 // er gelesen ist.
 static const int64_t kResultHoldUs = 8 * 1000000;
 
+// Die Logansicht nimmt das ganze Bild. Das Wellenbild zeigt ohne laufendes
+// Mikrofon nur die Nulllinie, und das Mikrofon laeuft nur bei gedrueckter
+// Taste — waehrend einer Aufnahme uebernimmt aber ohnehin die
+// Aufnahmeansicht. Im Ruhezustand ist unter der Kopfzeile also nichts, was
+// dem Log den Platz streitig machen koennte.
+static const int kLogX    = 4;
+static const int kLogTop  = kHeaderBottom + 5;
+static const int kLogStep = 10;                 // 7 Pixel Schrift, 3 Luft
+static const int kLogCols = (LCD_WIDTH - 2 * kLogX) / kFontAdvance;   // 65
+static const int kLogRows = (LCD_HEIGHT - kLogTop) / kLogStep;
+
+// Mehr Zeilen als Reihen braucht niemand zu holen: jede Zeile belegt
+// mindestens eine Reihe.
+static const int kLogFetch = (kLogRows < logview::kLines) ? kLogRows
+                                                          : logview::kLines;
+
+// Welche der beiden Ruheansichten gilt. Das Log steht vorn, weil es die
+// Frage beantwortet, die man vor dem Geraet tatsaechlich hat: was macht es
+// gerade? Die Kennzahlen sind einen Tastendruck entfernt.
+static volatile int log_ansicht = 1;
+
+// Antwortansicht: nimmt wie das Log das ganze Bild. Das Wellenbild zeigt
+// waehrenddessen nur die Nulllinie — das Mikrofon ist laengst wieder zu —,
+// und die Antwort ist das, was jetzt zaehlt.
+static const int kFrageY     = kPhaseY + 20;
+static const int kFrageStep  = 10;
+static const int kFrageLines = 3;
+static const int kAntwortY   = kFrageY + kFrageStep * kFrageLines + 8;
+static const int kAntwortLines = (LCD_HEIGHT - kAntwortY) / kTextStep;   // 10
+
 // 24 kHz, nicht 16: die Realtime-API bekommt den Ton so, wie er aufgenommen
 // wurde, und 24 kHz ist dort die Rate, auf die alles ausgelegt ist.
 // Umrechnen auf dem Geraet waere zusaetzlicher Code an einer Stelle, an der
@@ -485,21 +530,86 @@ static void draw_header(const char *links, const char *rechts)
                   rechts, ColorWhite, 1);
 }
 
+// Rechts in der Kopfzeile steht, was einem Tastendruck im Weg stehen
+// koennte. "BEREIT" allein waere eine Behauptung, die ohne WLAN oder ohne
+// Schluessel nicht stimmt. Beide Ruheansichten zeigen dieselbe Zeile — der
+// Zustand des Geraets haengt nicht davon ab, wohin man gerade schaut.
+static void status_text(char *buf, size_t n)
+{
+    if (net::provisioning()) {
+        snprintf(buf, n, "WLAN EINRICHTEN");
+    } else if (stt.phase() == Stt::Phase::Bereit) {
+        snprintf(buf, n, "BEREIT - KEY HALTEN");
+    } else if (stt.phase() == Stt::Phase::Fehler) {
+        snprintf(buf, n, "ERKENNUNG GESTOERT");
+    } else {
+        snprintf(buf, n, "%s", net::status());
+    }
+}
+
+// Logansicht: die juengsten Meldungen, neueste unten. Lange Zeilen laufen in
+// der naechsten Reihe weiter statt abgeschnitten zu werden — gerade bei
+// Fehlermeldungen steht das Entscheidende oft hinten.
+static void draw_log(void)
+{
+    static char zeilen[kLogFetch][logview::kCols + 1];
+
+    const int n = logview::snapshot(&zeilen[0][0], kLogFetch);
+
+    // Von hinten her so viele Zeilen nehmen, wie in die Flaeche passen. Die
+    // neueste Meldung ist die wichtigste und muss in jedem Fall aufs Bild,
+    // deshalb wird rueckwaerts gezaehlt und nicht vorwaerts gerechnet.
+    int erste  = n;
+    int reihen = 0;
+    while (erste > 0) {
+        const int len = (int)strlen(zeilen[erste - 1]);
+        int       r   = (len + kLogCols - 1) / kLogCols;
+        if (r < 1) r = 1;
+        if (reihen + r > kLogRows) break;
+        reihen += r;
+        erste--;
+    }
+
+    char stueck[kLogCols + 1];
+    int  y = kLogTop;
+
+    for (int i = erste; i < n; i++) {
+        const char *quelle = zeilen[i];
+        const int   len    = (int)strlen(quelle);
+
+        for (int off = 0; off == 0 || off < len; off += kLogCols) {
+            int m = len - off;
+            if (m > kLogCols) m = kLogCols;
+            if (m < 0) m = 0;
+            memcpy(stueck, quelle + off, (size_t)m);
+            stueck[m] = ' ';
+
+            display->text(kLogX, y, stueck, ColorBlack, 1);
+            y += kLogStep;
+        }
+    }
+}
+
 static void draw_stats(int32_t rms)
 {
     char buf[32];
 
-    // Rechts in der Kopfzeile steht, was einem Tastendruck im Weg stehen
-    // koennte. "BEREIT" allein waere eine Behauptung, die ohne WLAN oder
-    // ohne Schluessel nicht stimmt.
-    if (stt.phase() == Stt::Phase::Bereit) {
-        snprintf(buf, sizeof(buf), "BEREIT - KEY HALTEN");
-    } else if (stt.phase() == Stt::Phase::Fehler) {
-        snprintf(buf, sizeof(buf), "ERKENNUNG GESTOERT");
-    } else {
-        snprintf(buf, sizeof(buf), "%s", net::status());
+    status_text(buf, sizeof(buf));
+    draw_header("KENNZAHLEN - BOOT ZEIGT LOG", buf);
+
+    // Waehrend der Bereitstellung zaehlt nur eines: welches Geraet die App
+    // suchen soll und welchen Nachweis sie verlangt. Temperatur und Bildrate
+    // haben in diesem Moment niemanden, der sie braucht.
+    if (net::provisioning()) {
+        draw_field(kColLeftX, 40, "IN DER APP SUCHEN NACH", prov::device_name(), 3);
+        draw_field(kColLeftX, 104, "KENNWORTNACHWEIS", prov::pop(), 3);
+        display->text_wrapped(kColLeftX, 168, LCD_WIDTH - 2 * kColLeftX,
+                              "App: ESP BLE Provisioning von Espressif. "
+                              "Sobald ein Netz angenommen ist, geht es normal "
+                              "weiter - ein Neustart ist nicht noetig.",
+                              ColorBlack, 2, 18, 3);
+        return;
     }
-    draw_header("HOIHOI SCREEN ASSISTANT", buf);
 
     display->vline(kDividerX, kHeaderBottom + 7, kStatsBottom - 6, ColorBlack);
 
@@ -567,51 +677,24 @@ static void draw_stats(int32_t rms)
 // Aufnahmeansicht: belegt dasselbe Band wie die Kennzahlen, zeigt aber nur
 // dreierlei — dass aufgenommen wird, wie lange noch Platz ist, und was
 // bisher verstanden wurde.
-// Wiedergabezeichen: nach rechts zeigendes Dreieck, an derselben Stelle wie
-// der Aufnahmepunkt.
-static void draw_play_symbol(int cx, int cy, int r)
-{
-    for (int dy = -r; dy <= r; dy++) {
-        const int d = (dy < 0) ? -dy : dy;
-        display->hline(cx - r, cx + r - 2 * d, cy + dy, ColorBlack);
-    }
-}
-
 static void draw_listening(void)
 {
     char buf[48];
     static char text[Stt::kMaxText];   // static: 512 Byte gehoeren nicht auf
                                        // den Stack des Anzeigetasks
 
-    const bool    hoert  = listener.listening();
-    const bool    spielt = (play_active != 0);
-    const int32_t ms     = spielt ? play_ms
-                                  : (hoert ? listener.elapsed_ms()
-                                           : listener.last_ms());
+    const bool    hoert = listener.listening();
+    const int32_t ms    = hoert ? listener.elapsed_ms() : listener.last_ms();
+    const int32_t voll  = Listener::kMaxSeconds * 1000;
 
-    // Der Balken zeigt bei der Aufnahme den Weg zur Zehn-Sekunden-Schranke,
-    // bei der Wiedergabe den Weg durch das Aufgenommene. Beides ist dieselbe
-    // Frage — wie weit ist das hier? — und darf dieselbe Form haben.
-    const int32_t voll = spielt ? (play_total_ms > 0 ? play_total_ms : 1)
-                                : Listener::kMaxSeconds * 1000;
-
-    if (spielt) {
-        snprintf(buf, sizeof(buf), "%d.%d s / %d.%d s",
-                 (int)(ms / 1000), (int)((ms / 100) % 10),
-                 (int)(voll / 1000), (int)((voll / 100) % 10));
-    } else {
-        snprintf(buf, sizeof(buf), "%d.%d s / %d s",
-                 (int)(ms / 1000), (int)((ms / 100) % 10), Listener::kMaxSeconds);
-    }
-    draw_header(spielt ? "WIEDERGABE"
-                       : (hoert ? "AUFNAHME" : "AUFNAHME BEENDET"), buf);
+    snprintf(buf, sizeof(buf), "%d.%d s / %d s",
+             (int)(ms / 1000), (int)((ms / 100) % 10), Listener::kMaxSeconds);
+    draw_header(hoert ? "AUFNAHME" : "AUFNAHME BEENDET", buf);
 
     // Aufnahmezeichen: gefuellter Punkt, im Sekundentakt blinkend. Das
     // Blinken ist der Teil, der auch aus dem Augenwinkel ankommt — ein
     // stehender Punkt sieht aus wie ein gedrucktes Symbol.
-    if (spielt) {
-        draw_play_symbol(kDotCX, kDotCY, kDotR);
-    } else if (hoert && ((ms / 400) % 2) == 0) {
+    if (hoert && ((ms / 400) % 2) == 0) {
         display->fill_circle(kDotCX, kDotCY, kDotR, ColorBlack);
     } else {
         display->circle(kDotCX, kDotCY, kDotR, ColorBlack);
@@ -629,7 +712,7 @@ static void draw_listening(void)
     }
     // Sekundenmarken, damit der Balken eine Skala hat und nicht nur eine
     // Laenge. Sie werden invertiert, wo der Balken schon steht.
-    const int marken = spielt ? (int)((voll + 999) / 1000) : Listener::kMaxSeconds;
+    const int marken = Listener::kMaxSeconds;
     for (int s = 1; s < marken; s++) {
         const int x = kBarX0 + 2 + innen * s / marken;
         display->vline(x, kBarY0 + 2, kBarY1 - 2,
@@ -671,7 +754,6 @@ static bool aufnahme_ansicht(void)
     static int64_t bis = 0;
 
     const bool aktiv = listener.listening()
-                       || play_active != 0
                        || stt.phase() == Stt::Phase::Verbindet
                        || stt.phase() == Stt::Phase::Hoert
                        || stt.phase() == Stt::Phase::Wartet;
@@ -684,12 +766,129 @@ static bool aufnahme_ansicht(void)
     return jetzt < bis;
 }
 
+// Solange eine Antwort entsteht oder frisch ist, gehoert ihr das Bild. Sie
+// loest die Aufnahmeansicht ab, sobald die Frage draussen ist — die Aufnahme
+// ist dann vorbei, und wer gerade gesprochen hat, wartet auf die Antwort und
+// nicht auf einen Zeitbalken.
+static bool antwort_ansicht(void)
+{
+    static int64_t  bis     = 0;
+    static uint32_t gesehen = 0;
+
+    const Chat::Phase p = chat.phase();
+    const Tts::Phase  t = tts.phase();
+    const bool aktiv = (p == Chat::Phase::Fragt) || (p == Chat::Phase::Antwortet)
+                       || (t == Tts::Phase::Holt) || (t == Tts::Phase::Spricht);
+
+    const int64_t jetzt = esp_timer_get_time();
+    if (aktiv) {
+        bis = jetzt + kResultHoldUs;
+        return true;
+    }
+
+    // Nach dem letzten Stueck bleibt sie stehen, damit die Antwort gelesen
+    // werden kann und nicht im selben Augenblick verschwindet, in dem sie
+    // fertig ist.
+    const uint32_t seq = chat.antwort_seq();
+    if (seq != gesehen) {
+        gesehen = seq;
+        bis     = jetzt + kResultHoldUs;
+    }
+    return jetzt < bis;
+}
+
+static void draw_answer(void)
+{
+    char        buf[48];
+    static char frage[Chat::kMaxFrage];
+    static char antwort[Chat::kMaxAntwort];
+
+    // Rechts in der Kopfzeile steht der Schritt, der gerade laeuft: erst der
+    // Chat, dann die Stimme. Steht keiner mehr aus, die gebrauchte Zeit.
+    const Tts::Phase tp = tts.phase();
+    if (tp == Tts::Phase::Holt || tp == Tts::Phase::Spricht) {
+        snprintf(buf, sizeof(buf), "%s", tts.phase_text());
+    } else if (chat.phase() == Chat::Phase::Fragt
+               || chat.phase() == Chat::Phase::Antwortet) {
+        snprintf(buf, sizeof(buf), "%s", chat.phase_text());
+    } else {
+        const int32_t ms = chat.last_ms();
+        snprintf(buf, sizeof(buf), "%d.%d s",
+                 (int)(ms / 1000), (int)((ms / 100) % 10));
+    }
+    draw_header("ANTWORT", buf);
+
+    snprintf(buf, sizeof(buf), "CHAT: %s   STIMME: %s",
+             chat.phase_text(), tts.phase_text());
+    display->text(kColLeftX, kPhaseY, buf, ColorBlack, 1);
+    display->text(LCD_WIDTH - kColLeftX - Canvas::text_width(net::status(), 1),
+                  kPhaseY, net::status(), ColorBlack, 1);
+    display->hline(kColLeftX, LCD_WIDTH - kColLeftX - 1, kPhaseY + 12, ColorBlack);
+
+    // Die Frage klein darueber: ohne sie steht die Antwort ohne Bezug da, und
+    // bei einer falsch verstandenen Frage ist genau das die Erklaerung.
+    chat.copy_frage(frage, sizeof(frage));
+    if (frage[0] != ' ') {
+        display->text_wrapped(kColLeftX, kFrageY, LCD_WIDTH - 2 * kColLeftX,
+                              frage, ColorBlack, 1, kFrageStep, kFrageLines);
+    }
+
+    chat.copy_antwort(antwort, sizeof(antwort));
+    if (antwort[0] != ' ') {
+        display->text_wrapped(kColLeftX, kAntwortY, LCD_WIDTH - 2 * kColLeftX,
+                              antwort, ColorBlack, kTextScale, kTextStep,
+                              kAntwortLines);
+    } else {
+        const char *hinweis = (chat.phase() == Chat::Phase::Fehler)
+                                  ? "CHAT GESTOERT"
+                                  : "DENKT NACH ...";
+        display->text(kColLeftX, kAntwortY, hinweis, ColorBlack, kTextScale);
+    }
+}
+
+// BOOT schaltet zwischen Log und Kennzahlen um. Die Taste haengt an keinem
+// Interrupt, sondern wird einmal je Bild abgefragt — 37 ms Abstand sind
+// zugleich die Entprellung, dieselbe Ueberlegung wie bei der KEY-Taste.
+// Ausgewertet wird die fallende Flanke: sonst liefe die Ansicht durch,
+// solange jemand die Taste haelt.
+static void poll_view_button(void)
+{
+    static int vorher = 1;
+
+    const int jetzt = gpio_get_level(BOOT_BUTTON_PIN);
+    if (vorher != 0 && jetzt == 0) log_ansicht = !log_ansicht;
+    vorher = jetzt;
+}
+
 static void draw_scope(const int16_t *lo, const int16_t *hi, int head,
                        int32_t scale, int32_t rms, int32_t peak)
 {
     display->clear(ColorWhite);
 
-    if (aufnahme_ansicht()) {
+    // Die Antwort geht vor: sie kommt spaeter als die Aufnahme und loest sie
+    // damit sauber ab, ohne dass eine der beiden Ansichten von der anderen
+    // wissen muesste.
+    if (antwort_ansicht() && !net::provisioning()) {
+        draw_answer();
+        display->flush();
+        return;
+    }
+
+    const bool aufnahme = aufnahme_ansicht();
+
+    // Waehrend der Bereitstellung gewinnt die Kennzahlenansicht, egal was
+    // eingestellt ist: dort und nur dort stehen Geraetename und Nachweis,
+    // ohne die in der App nichts zu finden ist.
+    if (!aufnahme && log_ansicht && !net::provisioning()) {
+        char buf[32];
+        status_text(buf, sizeof(buf));
+        draw_header("LOG - BOOT ZEIGT KENNZAHLEN", buf);
+        draw_log();
+        display->flush();
+        return;
+    }
+
+    if (aufnahme) {
         draw_listening();
     } else {
         draw_stats(rms);
@@ -763,6 +962,8 @@ static void display_task(void *)
         peak  = shared_peak;
         xSemaphoreGive(scope_lock);
 
+        poll_view_button();
+
         const int64_t t0 = esp_timer_get_time();
         draw_scope(lo, hi, head, scale, rms, peak);
         const int32_t dt = (int32_t)(esp_timer_get_time() - t0);
@@ -797,52 +998,6 @@ static void stats_task(void *)
     }
 }
 
-static void playback_task(void *)
-{
-    // 20 ms je Schreibvorgang: klein genug, dass ein neuer Tastendruck die
-    // Wiedergabe fast sofort abbricht, gross genug, um nicht in Aufrufen zu
-    // ertrinken.
-    static const size_t kChunk = kSampleRate / 50;
-
-    bool war_aktiv = false;
-
-    while (true) {
-        const bool aktiv = listener.listening();
-
-        if (!aktiv && war_aktiv) {
-            const int16_t *pcm = listener.samples();
-            const size_t   n   = listener.sample_count();
-
-            if (pcm != nullptr && n > 0 && speaker.start() == ESP_OK) {
-                play_total_ms = (int32_t)((int64_t)n * 1000 / kSampleRate);
-                play_ms       = 0;
-                play_active   = 1;
-                ESP_LOGI(TAG, "Wiedergabe: %u Frames, %d ms.",
-                         (unsigned)n, (int)play_total_ms);
-
-                for (size_t i = 0; i < n; i += kChunk) {
-                    size_t m = n - i;
-                    if (m > kChunk) m = kChunk;
-                    if (speaker.write_mono(&pcm[i], m) != ESP_OK) {
-                        ESP_LOGW(TAG, "Wiedergabe abgebrochen (Schreibfehler).");
-                        break;
-                    }
-                    play_ms = (int32_t)((int64_t)(i + m) * 1000 / kSampleRate);
-
-                    // Wer erneut drueckt, will sprechen und nicht zuhoeren.
-                    if (listener.listening()) break;
-                }
-
-                play_active = 0;
-                speaker.stop();
-                ESP_LOGI(TAG, "Wiedergabe beendet.");
-            }
-        }
-
-        war_aktiv = aktiv;
-        vTaskDelay(pdMS_TO_TICKS(20));
-    }
-}
 
 static void visualize_mic(void)
 {
@@ -893,6 +1048,17 @@ static void visualize_mic(void)
                  esp_err_to_name(serr));
     }
 
+    // Antwort auf die erkannte Frage. Haengt am Stt und braucht denselben
+    // Schluessel; ohne ihn bleibt es bei Aufnahme und Transkript.
+    const esp_err_t cerr = chat.begin(&stt, OPENAI_API_KEY, CHAT_MODEL);
+    if (cerr == ESP_OK) {
+        ESP_LOGI(TAG, "  Chat aktiv: %s.", CHAT_MODEL);
+    } else if (cerr == ESP_ERR_INVALID_ARG) {
+        ESP_LOGW(TAG, "  Kein OPENAI_API_KEY in secrets.h — keine Antworten.");
+    } else {
+        ESP_LOGE(TAG, "  Chat nicht gestartet (%s).", esp_err_to_name(cerr));
+    }
+
     // Anzeige auf den zweiten Kern, damit das Zeichnen die Aufnahme nicht
     // verdraengt und umgekehrt.
     xTaskCreatePinnedToCore(display_task, "display", 4096, nullptr, 4, nullptr, 1);
@@ -900,14 +1066,25 @@ static void visualize_mic(void)
     // Niedrige Prioritaet: die Sensorwerte duerfen warten, Bild und Ton nicht.
     xTaskCreatePinnedToCore(stats_task, "stats", 3072, nullptr, 2, nullptr, 0);
 
+    // Der Lautsprecher bleibt, die Wiedergabe der eigenen Aufnahme nicht.
+    // Sie war ein Diagnosemittel fuer die Aufnahmequalitaet, und die ist
+    // geklaert; ab jetzt gehoert der Wandler der gesprochenen Antwort.
     if (speaker.begin(i2c_bus, mic.sample_rate()) == ESP_OK) {
-        xTaskCreatePinnedToCore(playback_task, "playback", 3072, nullptr, 3,
-                                nullptr, 0);
-        ESP_LOGI(TAG, "  Wiedergabe bereit: nach dem Loslassen laeuft die "
-                      "Aufnahme ueber den Lautsprecher zurueck.");
+        ESP_LOGI(TAG, "  Lautsprecher bereit.");
     } else {
-        ESP_LOGW(TAG, "  Kein Lautsprecher — es wird aufgenommen, aber nicht "
-                      "zurueckgespielt.");
+        ESP_LOGW(TAG, "  Kein Lautsprecher — die Antwort bleibt stumm.");
+    }
+
+    // Sprachausgabe zuletzt: sie braucht den Lautsprecher und haengt am Chat.
+    const esp_err_t terr = tts.begin(&chat, &speaker, &listener,
+                                     OPENAI_API_KEY, TTS_MODEL, TTS_VOICE);
+    if (terr == ESP_OK) {
+        ESP_LOGI(TAG, "  Sprachausgabe aktiv: %s, Stimme %s.", TTS_MODEL, TTS_VOICE);
+    } else if (terr == ESP_ERR_INVALID_ARG) {
+        ESP_LOGW(TAG, "  Sprachausgabe aus — Antwort erscheint nur als Text.");
+    } else {
+        ESP_LOGE(TAG, "  Sprachausgabe nicht gestartet (%s).",
+                 esp_err_to_name(terr));
     }
 
     static int16_t block[kReadFrames];
@@ -1039,6 +1216,18 @@ static void visualize_mic(void)
 
 extern "C" void app_main(void)
 {
+    // Vor der ersten eigenen Meldung: alles, was ab hier geloggt wird, soll
+    // spaeter auch auf dem Display stehen. Bootloader und fruehe
+    // IDF-Initialisierung liegen davor und bleiben der seriellen
+    // Schnittstelle vorbehalten.
+    logview::begin();
+
+    // Die eigene Taktmeldung bleibt der seriellen Schnittstelle vorbehalten.
+    // Sie ist rund zweihundert Zeichen lang und kommt jede Sekunde; auf dem
+    // Display haette nach einer halben Minute nichts anderes mehr Platz —
+    // und alles, was darin steht, zeigt die Kennzahlenansicht ohnehin.
+    logview::mute("Pegel rms=");
+
     ESP_LOGI(TAG, "===== ESP32-S3-RLCD-4.2 Bring-up =====");
 
     // NVS zuerst: der WLAN-Treiber legt dort seine Kalibrierdaten ab und
@@ -1053,11 +1242,11 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK(nerr);
 
     // WLAN frueh und nebenlaeufig: bis der Bring-up durch ist, steht die
-    // Verbindung meist schon.
-    const esp_err_t werr = net::begin(WIFI_SSID, WIFI_PASSWORD);
-    if (werr == ESP_ERR_INVALID_ARG) {
-        ESP_LOGW(TAG, "Kein WIFI_SSID in secrets.h — Geraet bleibt offline.");
-    }
+    // Verbindung meist schon. Ist kein Netz bekannt oder keines erreichbar,
+    // geht stattdessen die Bereitstellung ueber Bluetooth auf — dann steht
+    // der Geraetename auf dem Display, siehe draw_stats().
+    cfg::begin();
+    net::begin();
 
     report_chip();
     init_i2c();

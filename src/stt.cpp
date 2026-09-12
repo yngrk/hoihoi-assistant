@@ -92,6 +92,15 @@ void Stt::copy_text(char *out, size_t n) const
     }
 }
 
+void Stt::copy_final(char *out, size_t n) const
+{
+    if (out == nullptr || n == 0) return;
+
+    xSemaphoreTake(text_lock_, portMAX_DELAY);
+    snprintf(out, n, "%s", final_);
+    xSemaphoreGive(text_lock_);
+}
+
 void Stt::set_text(const char *s)
 {
     xSemaphoreTake(text_lock_, portMAX_DELAY);
@@ -176,6 +185,15 @@ void Stt::on_message(const char *data, int len)
         } else if (strcmp(t, "conversation.item.input_audio_transcription.completed") == 0) {
             const cJSON *tr = cJSON_GetObjectItemCaseSensitive(root, "transcript");
             if (cJSON_IsString(tr)) set_text(tr->valuestring);
+
+            // Erst den Endtext sichern, dann den Zaehler hochsetzen: wer auf
+            // den Zaehler wartet, findet den Text dann in jedem Fall schon
+            // vollstaendig vor.
+            xSemaphoreTake(text_lock_, portMAX_DELAY);
+            snprintf(final_, sizeof(final_), "%s", text_);
+            xSemaphoreGive(text_lock_);
+            final_seq_++;
+
             endtext_ = 1;
             ESP_LOGI(TAG, "Endtext: %s",
                      cJSON_IsString(tr) ? tr->valuestring : "(leer)");
@@ -240,8 +258,11 @@ bool Stt::send_audio(const int16_t *pcm, size_t frames)
 esp_err_t Stt::open_session()
 {
     char header[256];
-    snprintf(header, sizeof(header),
-             "Authorization: Bearer %s\r\nOpenAI-Beta: realtime=v1\r\n", key_);
+    // Kein OpenAI-Beta-Header: die Beta-Fassung der Realtime-API ist
+    // abgeschaltet, und der Header ist nicht bloss ueberfluessig, sondern
+    // der Grund fuer die Ablehnung — "The Realtime Beta API is no longer
+    // supported. Please use /v1/realtime for the GA API."
+    snprintf(header, sizeof(header), "Authorization: Bearer %s\r\n", key_);
 
     esp_websocket_client_config_t cfg = {};
     cfg.uri                     = kUri;
