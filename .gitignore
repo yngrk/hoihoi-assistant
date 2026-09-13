@@ -12,3 +12,6 @@ managed_components/
 
 # WLAN-Zugangsdaten und API-Schluessel. Muster in src/secrets.h.example.
 src/secrets.h
+
+# Grafiken aus MapleStory gehoeren Nexon und werden nicht weitergegeben.
+assets/karte/

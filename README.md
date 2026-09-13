@@ -81,6 +81,8 @@ src/user_config.h         Pinbelegung
 src/gfx.h, src/gfx.cpp    Clippende Zeichenschicht über dem Treiber
 src/display_sync.h, .cpp  DisplayPort mit Rückmeldung über das DMA-Ende
 src/font5x7.h, .cpp       5×7-Bitmapfont, ASCII 0x20–0x7F plus ä ö ü ß
+src/avatar.h, .cpp        HoiHoi als Bild, 400×300, erzeugt aus assets/avatar.png
+tools/avatar.py           Rechnet den Avatar für das Panel um
 src/audio.h, src/audio.cpp  ES7210 und ES8311 im Vollduplex an einem I²S-Port
 src/listen.h, .cpp        Aufnahme nach dem Weckwort, Mitschnitt im PSRAM
 src/net.h, .cpp           WLAN im Stationsbetrieb
@@ -124,50 +126,43 @@ zum Upstream und die Absicherung ist trotzdem lückenlos. **Nicht direkt
    Bausteine namentlich.
 3. **SHTC3-Messung** — Wakeup, Messbefehl, Auslesen, Sleep. Beweist, dass der
    Bus nicht nur ACKt, sondern plausible Werte liefert.
-4. **Display** — Testbild aus Rahmen, zwei Diagonalen, einem asymmetrischen
-   Marker links oben und einem Schachbrett. Der Rahmen prüft die Ränder (er
-   liegt exakt auf Zeile 0/299 und Spalte 0/399 — auf Hardware verifiziert, dort
-   verdeckt keine Blende etwas), die Diagonalen die Adressierung, das
-   Schachbrett die Bit-Packung innerhalb eines Bytes, der Marker die
-   Orientierung: die anderen Elemente sind symmetrisch und würden eine
-   Spiegelung nicht verraten. Danach elf Zeichenaufrufe mit Koordinaten
-   außerhalb der Fläche als Selbsttest der Bereichsprüfung.
+4. **Display** — zeigt HoiHoi als Avatar, eine Katze im Raumhelm, bildschirmfüllend
+   400×300 und sonst nichts. Das Bild entsteht mit `python tools/avatar.py`
+   aus `assets/avatar.png` als `src/avatar.cpp`; `assets/avatar_display.png`
+   zeigt das Ergebnis Pixel für Pixel. Das frühere Testbild (Rahmen auf der
+   Kante, Diagonalen, Marker, Schachbrett) hat Ränder, Adressierung und
+   Bit-Packung auf der Hardware bestätigt und ist damit entfallen. Danach elf
+   Zeichenaufrufe mit Koordinaten außerhalb der Fläche als Selbsttest der
+   Bereichsprüfung.
 5. **Tasten und Batterie** — Zustand beider Tasten und Batterie-Rohwert.
 6. **Mikrofon** — läuft anschließend dauerhaft, siehe unten.
 
 ## Bildaufbau
 
-Die Fläche ist in drei Bänder über die volle Breite geteilt, nach einem
-Figma-Entwurf mit den Anteilen 76 / 19 / 4 Prozent bei 4:3:
+Auf dem Display steht nur HoiHoi: eine hochintelligente Katze im Raumanzug,
+als Bild über die volle Fläche. Es wird beim Start einmal gezeichnet und bleibt stehen —
+Ansichten mit Kennzahlen, Wellenbild, Transkript oder Antwort gibt es nicht
+mehr, und damit auch keinen Anzeigetask. Was das Gerät gerade tut, steht im
+Log auf der seriellen Schnittstelle.
 
-| Band | Zeilen | Inhalt |
-|---|---|---|
-| stats | 0–227 | Kopfzeile, Umweltwerte links, Systemzustand rechts — während einer Aufnahme stattdessen Aufnahmezustand und Transkript |
-| audio wave visualizer | 230–286 | Wellenbild, eine Sekunde Signal |
-| audio scale | 290–299 | Pegelbalken in dBFS |
+Die Vorlage ist selbst schon gerastert, aber in einem anderen Maßstab als das
+Panel (etwa 3,5 Bildpunkte je Rasterpunkt). Einfach verkleinert schlägt das
+alte Raster gegen das neue und ergibt Moiré. `tools/avatar.py` zeichnet deshalb
+erst leicht weich, verkleinert flächentreu auf 400×300 (Überstand wird mittig
+beschnitten), hebt die Mitteltöne mit Gamma 0,8 an und rastert neu nach
+Atkinson — das gibt nur drei Viertel des Fehlers weiter, Linien und ruhige
+Flächen bleiben sauber. Ohne die Anhebung versänken Fell und Helm des
+überwiegend dunklen Bildes im Schwarz. Das Skript braucht nur die Standardbibliothek und legt
+neben `src/avatar.cpp` auch `assets/avatar_display.png` ab, das Bild so, wie es
+das Panel zeigt.
 
-Text kommt aus einem eigenen 5×7-Bitmapfont, nicht aus LVGL. Bei einem Bit je
-Pixel gibt es nichts zu rastern und nichts zu glätten, und so bleiben die
-Bereichsprüfung und die TE-Synchronisation in `Canvas` unverändert gültig —
-LVGL brächte sein eigenes Puffer- und Auffrischmodell mit und würde beides
-verdrängen. `Canvas::text()` skaliert ganzzahlig; Hierarchie entsteht über die
-Zeichengröße, weil Graustufen für diesen Zweck fehlen. `0x7F` ist im Font kein
-DEL, sondern ein Gradzeichen.
+Für spätere Ansichten bleibt die Zeichenschicht vollständig: `Canvas` mit
+Linien, Kreisen, Bitmaps und dem eigenen 5×7-Bitmapfont. Kein LVGL: bei einem
+Bit je Pixel gibt es nichts zu rastern und nichts zu glätten, und so bleiben
+Bereichsprüfung und TE-Synchronisation in `Canvas` gültig. `0x7F` ist im Font
+kein DEL, sondern ein Gradzeichen.
 
-Die Umweltwerte liest ein eigener `stats_task` alle zwei Sekunden. Eine
-SHTC3-Messung wartet 16 ms — im Aufnahmetask kostete das Abtastwerte, im
-Anzeigetask ein halbes Bild. Die Werte stehen in ausgerichteten 32-Bit-Worten
-ohne Mutex: Schreiben und Lesen sind dort unteilbar, und ob die Anzeige einen
-Messwert ein Bild später übernimmt, ist bei zwei Sekunden Messabstand ohne
-Belang.
-
-Das Stats-Band wird in jedem Bild neu gezeichnet, obwohl sich sein Inhalt
-höchstens sekündlich ändert. Das ist bewusst: von den 37 ms Bildperiode gehen
-nur wenige Millisekunden fürs Zeichnen drauf, der Rest ist ohnehin Warten auf
-die Austastlücke. Eine Teilaktualisierung würde Zustand einführen, ohne Zeit zu
-sparen.
-
-## Mikrofon-Visualisierung
+## Mikrofon und Bildübertragung
 
 Die beiden Onboard-Mikrofone hängen am ES7210, einem reinen ADC. Der ESP32-S3
 ist I²S-Master und gibt Takt und Wortsynchronisation vor, der ES7210 läuft als
@@ -175,22 +170,19 @@ Slave — MCLK muss deshalb bespielt werden, sonst arbeitet der Wandler ohne
 Referenz. Die Registerprogrammierung übernimmt Espressifs `esp_codec_dev`; das
 ist deutlich verlässlicher, als die Werte selbst herzuleiten.
 
-24 kHz, 16 Bit, beide Kanäle zu Mono gemittelt. 60 Frames je Bildspalte mal 400
-Spalten ergeben genau eine Sekunde Signal über die volle Breite; das Bild läuft
-nach links weg.
+24 kHz, 16 Bit, beide Kanäle zu Mono gemittelt, in Blöcken von 20 ms.
 
 24 kHz und nicht 16, seit die Transkription dazugekommen ist: die Realtime-API
 ist auf 24 kHz ausgelegt, und so geht der Ton unverändert hinaus. Umrechnen auf
 dem Gerät wäre zusätzlicher Code an einer Stelle, an der ein Fehler nur als
 schlechtere Erkennung auffiele.
 
-Aufnahme und Anzeige laufen in **getrennten Tasks**, und das ist keine
-Stilfrage. Das Panel gibt über die TE-Leitung 27,03 Hz vor (gemessen: 36990 µs,
-sehr stabil). Waren beide aneinandergekoppelt, lag die Bildrate auf dem
-Audiotakt von 25 Hz — zwei fast gleiche Frequenzen ergeben eine Schwebung von
-gut 2 Hz, sichtbar als regelmäßiges Stottern. Entkoppelt taktet sich die
-Anzeige über die TE-Leitung selbst auf die Panelfrequenz, die Aufnahme läuft in
-ihrem eigenen Takt, und keine zieht die andere.
+Solange es noch ein bewegtes Bild gab, liefen Aufnahme und Anzeige in
+**getrennten Tasks**: das Panel gibt über die TE-Leitung 27,03 Hz vor
+(gemessen: 36990 µs), der Audiotakt liegt bei 25 Hz, und aneinandergekoppelt
+ergaben beide eine Schwebung von gut 2 Hz, sichtbar als Stottern. Mit dem
+stehenden Avatar ist der Anzeigetask entfallen; die Erkenntnisse zur
+Übertragung gelten für jede künftige Ansicht weiter.
 
 Die TE-Synchronisation steckt in `Canvas` ([src/gfx.h](src/gfx.h)), nicht im
 Treiber. `RLCD_Init()` schaltet die Leitung bereits ein (Befehl `0x35` mit
@@ -204,9 +196,7 @@ Dieselbe Asynchronität hatte einen zweiten, davon unabhängigen Effekt: nach de
 Absetzen lief der Zeichencode sofort weiter und überschrieb mit
 `RLCD_ColorClear()` denselben Puffer, aus dem das DMA noch zwölf Millisekunden
 lang las. Das Panel bekam die oberen Zeilen aus dem alten und die unteren aus
-dem neuen Bild. Bei 27 Hz und einem Wellenbild, das sich ohnehin bewegt, fällt
-das kaum auf — mit einem stehenden Stats-Band und erst recht bei 51 Hz wäre es
-deutlich geworden.
+dem neuen Bild.
 
 `SyncDisplay` ([src/display_sync.h](src/display_sync.h)) hängt dafür den
 Rückruf `on_color_trans_done` an den Panel-IO und lässt `flush()` warten, bis
@@ -216,15 +206,8 @@ auf die nächste Austastlücke. Auf Hardware gemessen bleibt die Bildrate bei
 27/s und die TE-Periode bei 36990 µs, ohne eine einzige ausbleibende
 Abschlussmeldung.
 
-Der Vollausschlag skaliert automatisch — sofort auf, langsam wieder zu, nie
-unter einen Sockelwert. Die Empfindlichkeit der Mikrofone ist nicht
-dokumentiert, ein fester Faktor würde also entweder in Stille das Grundrauschen
-aufblasen oder bei Sprache am Anschlag kleben.
-
 Auf der Hardware gemessen: Grundrauschen bei −63 dBFS, Raumgeräusch um
-−40 dBFS, laute Sprache −21 dBFS — über 40 dB nutzbarer Dynamikumfang. Das
-Zeichnen selbst kostet rund 4 ms, der Rest der 37 ms ist gewolltes Warten auf
-die Austastlücke.
+−40 dBFS, laute Sprache −21 dBFS — über 40 dB nutzbarer Dynamikumfang.
 
 ## Zuhören, wenn das Weckwort gefallen ist
 
@@ -464,23 +447,6 @@ cp src/secrets.h.example src/secrets.h
 Ohne `WIFI_SSID` bleibt das Gerät offline, ohne `OPENAI_API_KEY` wird
 aufgenommen, aber nicht erkannt — die übrige Firmware läuft in beiden Fällen
 unverändert weiter, und der Bring-up sagt im Log, was fehlt.
-
-### Anzeige während der Aufnahme
-
-Das obere Band wechselt für die Dauer der Aufnahme die Einteilung: statt der
-Kennzahlen stehen dort ein blinkender Aufnahmepunkt, ein Zeitbalken mit
-Sekundenmarken bis zur Zehn-Sekunden-Schranke, eine Zeile über den Zustand der
-Erkennung und darunter der Text, so wie er hereinkommt. Wer spricht, schaut auf
-den Text und nicht auf die Batteriespannung.
-
-Der Text wird mit Wortumbruch gesetzt und zeigt bei Überlänge die **letzten**
-acht Zeilen — bei einem laufenden Transkript ist das Ende das Interessante.
-Acht Sekunden nach dem Abschluss kehrt die Anzeige zu den Kennzahlen zurück;
-kürzer wäre das Ergebnis weg, bevor es gelesen ist.
-
-Der Font kennt dafür vier zusätzliche Zeichen: ä, ö, ü und ß. Die großen
-Umlaute passen nicht in sieben Zeilen und werden zu Ae, Oe, Ue umgeschrieben,
-alles andere außerhalb von ASCII wird ein Fragezeichen.
 
 ## Von der Frage zur Antwort
 
@@ -897,42 +863,16 @@ Einschalten ist das Gerät wieder leer — und eine Messung der Fehlauslösungen
 
 ## Was auf dem Display steht
 
-Das Log stand hier einmal, und es ist wieder verschwunden. Nicht aus
-Platzgründen: es beantwortete die falsche Frage. Wer vor dem Gerät steht und es
-zum Sprechen bringen will, sucht nicht nach der letzten Meldung, sondern nach
-dem nächsten Handgriff — und muss dabei sehen, ob er überhaupt gehört wird. Das
-Log bleibt der seriellen Schnittstelle, wo es hingehört und wo es rückwärts
-lesbar ist.
+Nur der Avatar, siehe [Bildaufbau](#bildaufbau). Früher gab es hier eine
+Weckwortansicht mit Pegelbalken und Abstandszahl, Kennzahlen, eine
+Aufnahme- und eine Antwortansicht sowie eine Testansicht für das Weckwort; sie
+sind zugunsten der Persona entfallen und stehen in der Git-Historie.
 
-An seiner Stelle steht die **Weckwortansicht**. Sie zeigt je nach Zustand genau
-einen Handgriff, groß genug für das andere Ende des Tisches:
-
-| Zustand | was groß draufsteht |
-|---|---|
-| keine Vorlage | `BOOT LANG HALTEN` |
-| lernt ein | `SAG HOIHOI` und vier Kästen, gefüllt was steht |
-| bereit | `SAG HOIHOI` |
-
-Darunter, im Zustand „bereit", der Abstand des zuletzt bewerteten Wortes als
-Zahl und als Balken mit der Schwelle als Strich. Eine Zahl allein sagt nicht,
-ob 10,9 knapp daneben oder weit weg ist.
-
-Am Fuß läuft in jedem Zustand ein Pegelbalken mit — der einzige Teil des Bildes,
-der sich ständig bewegt, und genau das ist seine Aufgabe. Der Strich darin ist
-die Schwelle, ab der die Wortabgrenzung überhaupt hinhört; rechts daneben
-erscheint invers `WORT LAEUFT`, solange ein Wort durch die Abgrenzung läuft.
-
-Damit sind die drei Fälle auseinanderzuhalten, die von außen alle gleich
-aussehen — nämlich wie ein defektes Gerät:
-
-- **Balken bewegt sich nicht** → das Mikrofon hört nichts.
-- **Balken bleibt links vom Strich** → zu leise, wird nie als Wort betrachtet.
-- **`WORT LAEUFT` blinkt auf, es passiert nichts** → gehört, verglichen,
-  abgelehnt. Dann sagt die Abstandszahl, ob es knapp war.
-
-BOOT schaltet kurz gedrückt zu den Kennzahlen um und lang gehalten ins
-Einlernen; während der Einrichtung gewinnt immer die Kennzahlenansicht, weil nur
-dort Gerätename und Nachweis stehen.
+Was sie gezeigt haben, steht jetzt im Log: Pegel und Tasten jede Sekunde,
+Abstand und Treffer jedes bewerteten Wortes, Transkript und Antwort. BOOT lang
+gehalten startet weiter das Einlernen des Weckworts, der Fortschritt steht im
+Log. Auch die Einrichtung über BLE meldet Gerätenamen und Nachweis für die App
+dort (`Bereitstellung laeuft: …`).
 
 ## Offene Punkte
 

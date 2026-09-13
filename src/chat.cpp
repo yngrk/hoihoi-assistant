@@ -8,6 +8,7 @@
 #include <esp_log.h>
 #include <esp_timer.h>
 #include <freertos/task.h>
+#include <freertos/idf_additions.h>
 
 #include "net.h"
 
@@ -73,8 +74,10 @@ esp_err_t Chat::begin(Stt *quelle, const char *key, const char *model)
     phase_   = (int32_t)Phase::Bereit;
 
     // Kern 0 wie der Stt-Task: Kern 1 bleibt der Anzeige und der Aufnahme.
-    // 8192 Byte, weil in diesem Task der TLS-Handschlag stattfindet.
-    if (xTaskCreatePinnedToCore(task_trampolin, "chat", 8192, this, 3, nullptr, 0)
+    // 8192 Byte, weil in diesem Task der TLS-Handschlag stattfindet — im
+    // PSRAM, siehe Stt::begin().
+    if (xTaskCreatePinnedToCoreWithCaps(task_trampolin, "chat", 8192, this, 3, nullptr, 0,
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
         != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
@@ -340,7 +343,7 @@ void Chat::frage_stellen(const char *frage)
         // Nicht auf den Verbindungsabbau warten: bei einem Ereignisstrom
         // steht [DONE] vor dem Schluss, und wer auf das Ende des Sockets
         // wartet, verschenkt die letzte Sekunde.
-        while (!sse_done_) {
+        while (!sse_done_ && !verworfen()) {
             const int r = weg_.lesen(lese_, kLeseBytes);
             if (r <= 0) break;
             sse_feed(lese_, r);
@@ -348,7 +351,7 @@ void Chat::frage_stellen(const char *frage)
         // Nach [DONE] steht nur noch der Schlusschunk aus. Er liegt in aller
         // Regel schon im selben Paket; kommt er nicht, ist die Verbindung
         // eben weg, und das kostet weniger als darauf zu warten.
-        if (sse_done_) {
+        if (sse_done_ && !verworfen()) {
             weg_.leerlesen(300);
             sauber = weg_.vollstaendig();
         }
@@ -362,7 +365,22 @@ void Chat::frage_stellen(const char *frage)
         sauber = weg_.vollstaendig();
     }
 
+    // Ein abgebrochener Strom steckt noch halb im Socket, die Verbindung
+    // wird also nicht wiederverwendet (sauber bleibt false).
     weg_.abschluss(sauber);
+
+    if (verworfen()) {
+        // Kein Satz mehr fuer die Stimme, und nichts davon in den Verlauf.
+        xSemaphoreTake(lock_, portMAX_DELAY);
+        antwort_[0]  = '\0';
+        antwort_len_ = 0;
+        fertig_bis_  = 0;
+        xSemaphoreGive(lock_);
+        last_ms_ = (int32_t)((esp_timer_get_time() - t0) / 1000);
+        phase_   = (int32_t)Phase::Bereit;
+        ESP_LOGI(TAG, "Antwort abgebrochen (Taste) nach %d ms.", (int)last_ms_);
+        return;
+    }
 
     // Was noch kein ganzer Satz war, ist jetzt einer: hier endet die Antwort,
     // und der Rest muss gesprochen werden, auch ohne Punkt am Schluss.
@@ -425,11 +443,14 @@ void Chat::run()
 
             if (frage[0] == '\0') {
                 ESP_LOGI(TAG, "Leere Aeusserung, keine Anfrage.");
+            } else if (verworfen_ == (int32_t)jetzt) {
+                ESP_LOGI(TAG, "Frage per Taste verworfen: %s", frage);
             } else if (!net::connected()) {
                 ESP_LOGW(TAG, "Kein Netz, Frage faellt aus.");
                 phase_ = (int32_t)Phase::Fehler;
             } else {
                 ESP_LOGI(TAG, "Frage: %s", frage);
+                frage_seq_ = (int32_t)jetzt;
                 frage_stellen(frage);
             }
         }

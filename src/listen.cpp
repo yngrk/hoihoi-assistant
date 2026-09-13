@@ -108,6 +108,13 @@ void Listener::nachklang_erwarten()
     skip_min_ = (size_t)rate_ * kSkipMinMs / 1000;
 }
 
+void Listener::abbrechen()
+{
+    if (listening_ == 0) return;
+    sprach_ = false;   // damit bleibt der Mitschnitt leer, siehe stop()
+    stop("Taste");
+}
+
 void Listener::stop(const char *grund)
 {
     // Erst das Ergebnis, dann das Ende: wer auf die fallende Flanke von

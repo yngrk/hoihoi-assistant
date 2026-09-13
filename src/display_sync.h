@@ -62,6 +62,36 @@ class SyncDisplay : public DisplayPort {
     // Anzahl der Uebertragungen, deren Ende nicht gemeldet wurde.
     uint32_t dma_timeouts() const { return dma_timeouts_; }
 
+    // Pixel setzen ohne die Lookup-Tabellen des Treibers. Die liegen im PSRAM,
+    // 240 KB gross, und jeder Zugriff trifft eine andere Stelle — bei einem
+    // Vollbild aus 120000 Pixeln waren das gemessen bis zu 89 ms, mehr als
+    // zwei Bildperioden. Im Querformat ist die Zuordnung eine einfache Formel
+    // (siehe InitLandscapeLUT()): ein Byte im Puffer fasst zwei Spalten mal
+    // vier Zeilen, gezaehlt von unten. Keine Bereichspruefung, das tut Canvas.
+    void punkt(int x, int y, uint8_t color)
+    {
+        if (width_ != 400) {
+            RLCD_SetPixel((uint16_t)x, (uint16_t)y, color);
+            return;
+        }
+        const int     inv  = height_ - 1 - y;
+        const uint8_t mask = (uint8_t)(0x80 >> (((inv & 3) << 1) | (x & 1)));
+        uint8_t &b = DispBuffer[(x >> 1) * (height_ >> 2) + (inv >> 2)];
+        if (color) b |= mask; else b &= (uint8_t)~mask;
+    }
+
+    // Ganzes Bild aus einem Bit je Pixel, zeilenweise, hoechstes Bit links,
+    // 1 = schwarz. Byteweise statt pixelweise: je Pufferbyte werden die zwei
+    // passenden Bits aus vier Quellzeilen geholt, 15000 Schritte statt 120000.
+    // Nur im Querformat 400x300; sonst false, dann zeichnet der Aufrufer selbst.
+    bool vollbild(const uint8_t *bits);
+
+    // Den Puffer zum Schwarz hin abblenden, stufe 0 (schwarz) bis 64 (wie
+    // gezeichnet). Weiss bleibt nur, wo die 8x8-Bayer-Matrix unter der Stufe
+    // liegt — dieselbe Matrix, mit der tools/film.py rastert. Nur im
+    // Querformat 400x300, sonst wird bei 0 schwarz gefuellt und sonst nichts.
+    void abdunkeln(int stufe);
+
   private:
     static bool on_trans_done(esp_lcd_panel_io_handle_t io,
                               esp_lcd_panel_io_event_data_t *edata,

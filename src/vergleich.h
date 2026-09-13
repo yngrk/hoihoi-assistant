@@ -40,7 +40,7 @@
 // gleich, bei doppelter Rechenzeit. Delta ist deshalb wieder heraus.
 //
 // Gerechnet werden weiter "Wort" und "Fest", ausgeloest wird nach kAusloeser.
-// "Wort" bleibt als Vergleichsspalte im Log und in der Testansicht, damit
+// "Wort" bleibt als Vergleichsspalte im Log, damit
 // sich ein Rueckfall sofort zeigt.
 //
 // Der Vergleich laeuft in einem eigenen Task auf dem anderen Kern. Im

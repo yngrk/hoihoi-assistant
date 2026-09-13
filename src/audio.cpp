@@ -2,6 +2,7 @@
 
 #include "nachtrag.h"
 
+#include <math.h>
 #include <string.h>
 
 #include <driver/gpio.h>
@@ -400,6 +401,7 @@ void SpeakerOutput::stop()
 
     gpio_set_level((gpio_num_t)AMP_ENABLE_PIN, 0);
     running_ = false;
+    pegel_   = 0;
 }
 
 esp_err_t SpeakerOutput::write_mono(const int16_t *pcm, size_t frames)
@@ -411,10 +413,13 @@ esp_err_t SpeakerOutput::write_mono(const int16_t *pcm, size_t frames)
     // Der Schlitz auf dem Bus ist stereo. Ein Monosignal einfach
     // hineinzuschreiben hiesse, jeden zweiten Wert als anderen Kanal zu
     // deuten — das Ergebnis liefe halb so schnell und eine Oktave zu tief.
+    int64_t q = 0;
     for (size_t i = 0; i < frames; i++) {
         scratch_[i * kChannels]     = pcm[i];
         scratch_[i * kChannels + 1] = pcm[i];
+        q += (int64_t)pcm[i] * pcm[i];
     }
+    pegel_ = (int32_t)sqrt((double)(q / (int64_t)frames));
 
     const int bytes = (int)(frames * kChannels * sizeof(int16_t));
     return (esp_codec_dev_write(codec_, scratch_, bytes) == 0) ? ESP_OK : ESP_FAIL;

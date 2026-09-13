@@ -62,8 +62,10 @@ const int32_t kUnterbrechMs = 200;
 // Nach dem ersten Ton der Antwort muss sich das Filter erst einstellen:
 // gemessen daempfte es in der ersten Sekunde oft nur 6 bis 12 dB, danach 20
 // bis 48. In dieser Zeit muss ein Block kAnlaufFaktor mal ueber der Schwelle
-// liegen.
-const int32_t kAnlaufMs     = 1500;
+// liegen. 1500 ms waren zu kurz: bei einer kurzen Antwort nach langer Stille
+// stand die Daempfung nach 2,5 s erst bei 15 dB, 68 ms nach dem Anlauf kam
+// der Verdacht, und die Erkennung machte aus dem Echorest "GitHub ist ein."
+const int32_t kAnlaufMs     = 3000;
 const int32_t kAnlaufFaktor = 4;
 
 // Tabellen, Filter und Puffer. Im Haupttask, vor dem Aufnahmetask.

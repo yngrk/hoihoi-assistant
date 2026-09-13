@@ -3,7 +3,9 @@ idf_component_register(
          "listen.cpp" "net.cpp" "verbindung.cpp" "stt.cpp"
          "chat.cpp" "tts.cpp" "cfg.cpp" "prov.cpp" "nachtrag.cpp"
          "wachwort.cpp" "merkmal.cpp" "vergleich.cpp" "echo.cpp"
+         "film.cpp" "oberflaeche.cpp" "wetter.cpp" "schrift.cpp"
     INCLUDE_DIRS "."
+    EMBED_FILES "../assets/wach.film" "../assets/zu.film" "../assets/karte/pilz.bin" "../assets/karte/boden.bin" "../assets/karte/objekte.bin"
     REQUIRES port_bsp driver esp_adc esp_timer esp_psram esp_codec_dev esp-dsp
              esp_wifi esp_netif nvs_flash esp_event esp_websocket_client esp_http_client
              wifi_provisioning bt

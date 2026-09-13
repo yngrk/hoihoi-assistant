@@ -11,6 +11,7 @@
 #include <esp_timer.h>
 #include <esp_websocket_client.h>
 #include <freertos/task.h>
+#include <freertos/idf_additions.h>
 #include <mbedtls/base64.h>
 
 #include "net.h"
@@ -85,7 +86,11 @@ esp_err_t Stt::begin(Listener *quelle, uint32_t sample_rate,
 
     // Eigener Task: weder die Aufnahme noch die Anzeige duerfen auf das Netz
     // warten. Kern 0, damit der Anzeigetask auf Kern 1 ungestoert bleibt.
-    if (xTaskCreatePinnedToCore(task_trampolin, "stt", 6144, this, 3, nullptr, 0)
+    // Der Stack liegt im PSRAM: der interne Speicher reicht mit Weckwort,
+    // Echounterdrueckung und Netz nicht mehr fuer alle Stacks, und dieser
+    // Task wartet ohnehin meist auf das Netz.
+    if (xTaskCreatePinnedToCoreWithCaps(task_trampolin, "stt", 6144, this, 3, nullptr, 0,
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
         != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
@@ -229,6 +234,17 @@ void Stt::on_message(const char *data, int len)
             const cJSON *tr = cJSON_GetObjectItemCaseSensitive(root, "transcript");
             const bool echo = cJSON_IsString(tr) && tr->valuestring != nullptr
                               && strstr(tr->valuestring, kHinweisKern) != nullptr;
+            if (endtext_weg_) {
+                // Per Taste abgebrochen, waehrend er noch unterwegs war. Der
+                // Zaehler bleibt stehen, der Chat sieht davon nichts.
+                endtext_weg_ = 0;
+                endtext_     = 1;
+                set_text("");
+                ESP_LOGI(TAG, "Endtext verworfen (Taste): %s",
+                         cJSON_IsString(tr) ? tr->valuestring : "(leer)");
+                cJSON_Delete(root);
+                return;
+            }
             if (echo) {
                 ESP_LOGW(TAG, "Endtext ist der Hinweis selbst, verworfen: %s",
                          tr->valuestring);
@@ -443,6 +459,7 @@ void Stt::run()
             gesendet_       = 0;
             abschluss_offen = false;
             endtext_        = 0;
+            endtext_weg_    = 0;
             pruefung_       = quelle_->pruefung() ? 1 : 0;
             set_text("");
 
@@ -577,6 +594,28 @@ void Stt::run()
                 naechster_aufbau = esp_timer_get_time() + kAufbauPauseUs;
                 phase_           = (int32_t)Phase::Bereit;
                 abschluss_offen  = false;
+            }
+        }
+
+        // --- Taste: verwerfen ---
+        //
+        // Erst, wenn die Aufnahme zu ist. Laeuft sie noch, bricht der
+        // Listener sie gleich ab, und die Aeusserung endet oben ohne Frames.
+        if (verwerfen_ && !aktiv) {
+            verwerfen_ = 0;
+            if (abschluss_offen) {
+                if (client_ != nullptr && sitzung_ok_) {
+                    send_json("{\"type\":\"input_audio_buffer.clear\"}");
+                }
+                abschluss_offen = false;
+                gesendet_       = 0;
+                phase_          = (int32_t)Phase::Bereit;
+                ESP_LOGI(TAG, "Aeusserung verworfen (Taste), bevor sie drueben war.");
+            } else if (phase_ == (int32_t)Phase::Wartet) {
+                // Der Endtext ist unterwegs. Er kommt noch an, aber als Frage
+                // zaehlt er nicht mehr, siehe on_message().
+                endtext_weg_ = 1;
+                phase_       = (int32_t)Phase::Bereit;
             }
         }
 

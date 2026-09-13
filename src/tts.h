@@ -86,7 +86,15 @@ class Tts {
     // Wer die Sprechtaste drueckt, will sprechen und nicht zuhoeren. Die
     // laufende Ausgabe faellt dann weg — und zwar *bevor* das Mikrofon den
     // I2S-Port anfasst, denn beide haengen an derselben Datenschnittstelle.
-    void abbrechen() { if (auftrag_) abbruch_ = 1; }
+    //
+    // Die laufende Runde des Chats gilt danach als erledigt, auch wenn sie
+    // hier noch gar nicht angefangen hat: sonst finge die Stimme mit dem
+    // ersten Satz an, der kurz vor dem Abbruch fertig wurde.
+    void abbrechen()
+    {
+        if (quelle_ != nullptr) verworfen_ = (int32_t)quelle_->runde_seq();
+        if (auftrag_) abbruch_ = 1;
+    }
 
     // True, solange der Lautsprecher noch beschaeftigt ist. Der Aufnahmetask
     // wartet darauf, bevor er das Mikrofon oeffnet.
@@ -119,6 +127,7 @@ class Tts {
 
     volatile int32_t phase_     = 0;   // Phase
     volatile int32_t first_ms_  = 0;
+    volatile int32_t anlauf_ms_ = 0;   // Verstaerker an bis erster Sprachblock
     volatile int32_t spoken_ms_ = 0;
 
     // Beginn der Anfrage. Der Spieler braucht ihn, um die Zeit bis zum
@@ -127,6 +136,7 @@ class Tts {
     volatile int64_t start_us_ = 0;
 
     uint32_t gesehen_ = 0;   // zuletzt gesprochene Chat::runde_seq()
+    volatile int32_t verworfen_ = -1;   // per abbrechen() erledigte Chat::runde_seq()
 
     // Vorwaerm-Adresse und die stehende Verbindung, siehe verbindung.h.
     char       waerm_[128] = {0};

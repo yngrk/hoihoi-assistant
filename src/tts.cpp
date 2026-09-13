@@ -8,6 +8,7 @@
 #include <esp_log.h>
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
+#include <freertos/idf_additions.h>
 #include <freertos/task.h>
 
 #include "net.h"
@@ -21,14 +22,28 @@ static const char *kUrl = "https://api.openai.com/v1/audio/speech";
 // Aussprache aber sonst gelegentlich ins Englische kippt — gerade bei kurzen
 // Antworten, in denen zu wenig Sprache steht, um es zu erkennen.
 static const char *kAnweisung =
-    "Sprich Deutsch, ruhig und natuerlich, in normalem Tempo.";
+    "Sprich Deutsch, natuerlich und zuegig.";
+
+// In normalem Tempo klang es zu langsam; so viel schneller wie gewuenscht.
+static const double kTempo = 1.25;
 
 // Grosszuegig: die Verbindung steht waehrend der gesamten Ausgabe offen.
 static const int kWarteMs = 30000;
 
 // Stille zum Schluss. Der Verstaerker wird danach abgeschaltet, und ein
 // Wandler, der mitten im Signal stehenbleibt, tut das mit einem Knacks.
-static const size_t kAusklangFrames = 24000 / 50;   // 20 ms
+// write_mono() kehrt zurueck, sobald der Ton im DMA liegt, nicht wenn er
+// gespielt ist; der DMA fasst 8 x 240 Frames, also 80 ms. Die Stille muss
+// laenger sein, sonst schaltet der Verstaerker ab, waehrend das Satzende
+// noch in der Warteschlange steht.
+static const size_t kStilleFrames   = 24000 / 50;   // 20 ms je Block
+static const int    kAusklangBloecke = 6;            // 120 ms
+
+// Der Verstaerker braucht nach dem Einschalten einen Moment, bis er
+// durchlaesst. Ging der erste Sprachblock sofort hinterher, fehlte der
+// Anfang des ersten Worts. Er wird deshalb schon eingeschaltet, sobald der
+// erste Ton ankommt, und gespielt wird fruehestens so lange danach.
+static const int64_t kAnlaufUs = 300000;
 
 esp_err_t Tts::begin(Chat *quelle, SpeakerOutput *aus, Listener *taste,
                      const char *key, const char *model, const char *voice)
@@ -38,7 +53,7 @@ esp_err_t Tts::begin(Chat *quelle, SpeakerOutput *aus, Listener *taste,
     taste_  = taste;
     key_    = key;
     model_  = (model != nullptr && model[0] != '\0') ? model : "gpt-4o-mini-tts";
-    voice_  = (voice != nullptr && voice[0] != '\0') ? voice : "alloy";
+    voice_  = (voice != nullptr && voice[0] != '\0') ? voice : "cedar";
 
     if (quelle == nullptr || aus == nullptr || !aus->ready()
         || key == nullptr || key[0] == '\0') {
@@ -71,8 +86,10 @@ esp_err_t Tts::begin(Chat *quelle, SpeakerOutput *aus, Listener *taste,
                                 nullptr, 0) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
-    if (xTaskCreatePinnedToCore(hol_trampolin, "tts_hol", 8192, this, 3,
-                                nullptr, 0) != pdPASS) {
+    // Der Holer wartet auf das Netz, sein Stack liegt im PSRAM wie der von
+    // Stt und Chat. Der Spieler bleibt intern, er schreibt im Takt des Tons.
+    if (xTaskCreatePinnedToCoreWithCaps(hol_trampolin, "tts_hol", 8192, this, 3,
+                                        nullptr, 0, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
@@ -123,7 +140,7 @@ void Tts::ring_schreiben(const int16_t *pcm, size_t frames)
 
 void Tts::spielen()
 {
-    static int16_t stille[kAusklangFrames] = {};
+    static int16_t stille[kStilleFrames] = {};
 
     while (true) {
         if (!auftrag_) {
@@ -131,11 +148,35 @@ void Tts::spielen()
             continue;
         }
 
-        // Vorlauf abwarten — aber nicht ueber das Ende hinaus: eine kurze
-        // Antwort ist schon ganz da, bevor zwei Sekunden zusammenkommen.
-        while (!fertig_ && !abbruch_ && ring_belegt() < kVorlaufFrames) {
+        // Erst auf den ersten Ton warten. Solange das Netz rechnet, bleibt
+        // der Verstaerker aus — er rauscht, siehe audio.h.
+        while (!fertig_ && !abbruch_ && ring_belegt() == 0) {
             vTaskDelay(pdMS_TO_TICKS(5));
         }
+
+        bool    amp_an = false;
+        int64_t amp_us = 0;
+        if (!abbruch_ && ring_belegt() > 0) {
+            if (aus_->start() == ESP_OK) {
+                amp_an = true;
+                amp_us = esp_timer_get_time();
+            }
+        }
+
+        // Vorlauf abwarten — aber nicht ueber das Ende hinaus: eine kurze
+        // Antwort ist schon ganz da, bevor zwei Sekunden zusammenkommen.
+        // Der Verstaerker laeuft in dieser Zeit schon an.
+        while (amp_an && !fertig_ && !abbruch_ && ring_belegt() < kVorlaufFrames) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+
+        // Kam der Ton so schnell, dass der Vorlauf kuerzer war als das
+        // Anlaufen, wird die Luecke mit Stille gefuellt. Stille statt Warten:
+        // so steht der erste Sprachblock direkt hinter ihr im DMA.
+        while (amp_an && !abbruch_ && esp_timer_get_time() - amp_us < kAnlaufUs) {
+            if (aus_->write_mono(stille, kStilleFrames) != ESP_OK) break;
+        }
+        if (amp_an) anlauf_ms_ = (int32_t)((esp_timer_get_time() - amp_us) / 1000);
 
         bool laeuft = false;
 
@@ -153,7 +194,7 @@ void Tts::spielen()
             }
 
             if (!laeuft) {
-                if (aus_->start() != ESP_OK) break;
+                if (!amp_an) break;
                 laeuft    = true;
                 first_ms_ = (int32_t)((esp_timer_get_time() - start_us_) / 1000);
                 phase_    = (int32_t)Phase::Spricht;
@@ -192,8 +233,10 @@ void Tts::spielen()
             }
         }
 
-        if (laeuft) {
-            aus_->write_mono(stille, kAusklangFrames);
+        if (amp_an) {
+            for (int i = 0; i < kAusklangBloecke; i++) {
+                if (aus_->write_mono(stille, kStilleFrames) != ESP_OK) break;
+            }
             aus_->stop();
         }
 
@@ -216,6 +259,7 @@ size_t Tts::stueck_holen(const char *text)
     cJSON_AddStringToObject(root, "voice", voice_);
     cJSON_AddStringToObject(root, "input", text);
     cJSON_AddStringToObject(root, "instructions", kAnweisung);
+    cJSON_AddNumberToObject(root, "speed", kTempo);
     cJSON_AddStringToObject(root, "response_format", "pcm");
 
     char *rumpf = cJSON_PrintUnformatted(root);
@@ -283,6 +327,7 @@ void Tts::runde_spielen()
 {
     phase_      = (int32_t)Phase::Holt;
     first_ms_   = 0;
+    anlauf_ms_  = 0;
     spoken_ms_  = 0;
     stockungen_ = 0;
     hat_rest_   = false;
@@ -306,6 +351,10 @@ void Tts::runde_spielen()
         const bool     lief = quelle_->runde_laeuft();
         const uint32_t r    = quelle_->runde_seq();
         if (r != gesehen_) break;   // die naechste Frage hat uns ueberholt
+        if ((int32_t)r == verworfen_) {
+            abbruch_ = 1;           // abbrechen() kam, bevor der Auftrag stand
+            break;
+        }
 
         const size_t bis = quelle_->fertig_bis();
         if (bis > von) {
@@ -328,9 +377,9 @@ void Tts::runde_spielen()
     while (auftrag_) vTaskDelay(pdMS_TO_TICKS(10));
 
     if (gesamt_f > 0) {
-        ESP_LOGI(TAG, "Gesprochen: %d ms Ton, erster Ton nach %d ms, "
-                      "%d Stockungen, %d KB intern frei.",
-                 (int)((int64_t)gesamt_f * 1000 / kRate), (int)first_ms_,
+        ESP_LOGI(TAG, "Gesprochen: %d ms Ton, erster Ton nach %d ms "
+                      "(Verstaerker %d ms vorher an), %d Stockungen, %d KB intern frei.",
+                 (int)((int64_t)gesamt_f * 1000 / kRate), (int)first_ms_, (int)anlauf_ms_,
                  (int)stockungen_,
                  (int)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL
                                                | MALLOC_CAP_8BIT) / 1024));
@@ -362,7 +411,9 @@ void Tts::holen()
         if (jetzt != gesehen_) {
             // Erst anfangen, wenn der erste Satz dasteht. Vorher gaebe es
             // nichts zu schicken, und die Runde waere sofort wieder zu Ende.
-            if (quelle_->fertig_bis() > 0) {
+            if ((int32_t)jetzt == verworfen_) {
+                gesehen_ = jetzt;   // per Taste abgebrochen, bevor sie anfing
+            } else if (quelle_->fertig_bis() > 0) {
                 gesehen_ = jetzt;
                 if (!net::connected()) {
                     ESP_LOGW(TAG, "Kein Netz, Antwort bleibt stumm.");

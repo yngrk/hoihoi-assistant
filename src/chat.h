@@ -96,6 +96,11 @@ class Chat {
     int32_t last_ms() const { return last_ms_; }
     int32_t satz1_ms() const { return satz1_ms_; }
 
+    // Taste: die Frage zur zuletzt fertigen Aeusserung wird nicht (weiter)
+    // beantwortet. Laeuft die Antwort schon, bricht der Strom ab, der Text
+    // wird geleert und kommt nicht in den Verlauf.
+    void abbrechen() { if (quelle_ != nullptr) verworfen_ = (int32_t)quelle_->final_seq(); }
+
   private:
     static void task_trampolin(void *self);
 
@@ -145,6 +150,14 @@ class Chat {
     volatile int64_t runde_us_    = 0;
 
     uint32_t gesehen_ = 0;   // zuletzt verarbeitete Stt::final_seq()
+
+    // Abgebrochene Aeusserung (Stt::final_seq()) und die, deren Frage gerade
+    // laeuft. Zaehler statt Merker: ein Merker, der vor der Frage gesetzt
+    // wird, muesste irgendwann geloescht werden, und genau dazwischen kaeme
+    // die naechste.
+    volatile int32_t verworfen_ = -1;
+    int32_t          frage_seq_ = -2;
+    bool verworfen() const { return verworfen_ == frage_seq_; }
 
     char              frage_[kMaxFrage]     = {0};
     char              antwort_[kMaxAntwort] = {0};

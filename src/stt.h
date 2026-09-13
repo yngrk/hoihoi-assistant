@@ -84,6 +84,11 @@ class Stt {
     using Pruefer = bool (*)(const char *text);
     void pruefer(Pruefer f) { pruefer_ = f; }
 
+    // Taste: die Aeusserung, die gerade abgeschlossen wird oder auf ihren
+    // Endtext wartet, wird keine Frage. Eine laufende Aufnahme bricht der
+    // Listener ab, nicht diese Klasse.
+    void verwerfen() { verwerfen_ = 1; }
+
   private:
     static void task_trampolin(void *self);
     static void ws_event(void *handler_args, esp_event_base_t base,
@@ -123,6 +128,9 @@ class Stt {
 
     Pruefer          pruefer_  = nullptr;
     volatile int32_t pruefung_ = 0;   // die laufende Aeusserung ist eine Pruefaufnahme
+
+    volatile int32_t verwerfen_   = 0;   // Taste gedrueckt, noch nicht ausgewertet
+    volatile int32_t endtext_weg_ = 0;   // der ausstehende Endtext zaehlt nicht
 
     char              text_[kMaxText] = {0};
     size_t            text_len_       = 0;

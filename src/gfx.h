@@ -82,6 +82,14 @@ class Canvas {
     void circle(int cx, int cy, int r, uint8_t color);
     void fill_circle(int cx, int cy, int r, uint8_t color);
 
+    // Bild aus einem Bit je Pixel, linke obere Ecke bei (x, y). Zeilen sind
+    // auf ganze Bytes aufgefuellt, hoechstes Bit links; gesetzte Bits werden
+    // schwarz, geloeschte weiss — das Bild ersetzt also, was darunter stand.
+    void bitmap(int x, int y, int w, int h, const uint8_t *bits);
+
+    // Alles bisher Gezeichnete zum Schwarz hin abblenden, 0 bis 64.
+    void abdunkeln(int stufe) { d_.abdunkeln(stufe); }
+
     // Text aus dem 5x7-Bitmapfont. x/y ist die linke obere Ecke des ersten
     // Zeichens, scale vergroessert ganzzahlig — bei einem Bit je Pixel gibt es
     // keine Zwischenstufen, also auch keinen Grund fuer etwas anderes.

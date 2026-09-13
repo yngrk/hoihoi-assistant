@@ -223,6 +223,7 @@ size_t block_rechnen(int16_t *aus, size_t aus_max)
     }
 
     const int32_t rms  = effektiv(s_out, s_chunk);
+    const int32_t ref_rms = effektiv(s_ref, s_chunk);
     const bool    anlauf = s_ref_ms >= 0 && s_ref_ms < echo::kAnlaufMs;
     const bool    laut   = rms > (anlauf ? s_schwelle * echo::kAnlaufFaktor : s_schwelle);
     const bool    zaehlt = true;
@@ -253,9 +254,10 @@ size_t block_rechnen(int16_t *aus, size_t aus_max)
     if (!s_unterbrochen && s_zaehler_ms >= echo::kUnterbrechMs) {
         s_unterbrochen = true;
         nachtrag::schreiben('I', TAG, "Verdacht nach %d ms Antwort: Block %d ueber "
-                                      "Schwelle %d, Referenz seit %d ms.",
+                                      "Schwelle %d, Referenz seit %d ms, Referenz im "
+                                      "Block %d.",
                             (int)((esp_timer_get_time() - s_beginn_us) / 1000),
-                            (int)rms, (int)s_schwelle, (int)s_ref_ms);
+                            (int)rms, (int)s_schwelle, (int)s_ref_ms, (int)ref_rms);
     }
 
     size_t m = s_hoch.rechnen(s_out, s_chunk, s_hin);

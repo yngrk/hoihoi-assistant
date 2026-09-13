@@ -33,8 +33,10 @@
 
 class Listener {
   public:
-    // Obergrenze einer Aufnahme, und danach ist der Puffer bemessen.
-    static const int kMaxSeconds = 10;
+    // Obergrenze einer Aufnahme, und danach ist der Puffer bemessen. Zehn
+    // Sekunden schnitten laengere Fragen ab; das Ende soll die Stille setzen,
+    // nicht die Uhr. 60 s sind knapp 3 MB im PSRAM (8 MB).
+    static const int kMaxSeconds = 60;
 
     // Die ersten Millisekunden nach dem Einschalten des Wandlers werden
     // verworfen. Der ES7210 gibt beim Oeffnen einen Einschwinger ab, der als
@@ -134,6 +136,11 @@ class Listener {
     void nachklang_erwarten();
 
     bool listening() const { return listening_ != 0; }
+
+    // Die laufende Aufnahme verwerfen, als waere nichts gesagt worden: sie
+    // endet ohne Frames, und die Erkennung schickt nichts ab. Nur aus dem
+    // Aufnahmetask, wie feed().
+    void abbrechen();
 
     // Dauer der laufenden Aufnahme; 0, wenn gerade nicht zugehoert wird.
     int32_t elapsed_ms() const;

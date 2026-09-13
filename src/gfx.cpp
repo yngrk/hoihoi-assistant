@@ -88,7 +88,7 @@ void Canvas::pixel(int x, int y, uint8_t color)
     if (x < 0 || y < 0 || x >= width_ || y >= height_) {
         return;
     }
-    d_.RLCD_SetPixel((uint16_t)x, (uint16_t)y, color);
+    d_.punkt(x, y, color);
 }
 
 // Die Linienfunktionen clippen einmal vorab statt sich auf pixel() zu
@@ -105,7 +105,7 @@ void Canvas::hline(int x0, int x1, int y, uint8_t color)
     if (x1 >= width_) x1 = width_ - 1;
 
     for (int x = x0; x <= x1; x++) {
-        d_.RLCD_SetPixel((uint16_t)x, (uint16_t)y, color);
+        d_.punkt(x, y, color);
     }
 }
 
@@ -118,7 +118,7 @@ void Canvas::vline(int x, int y0, int y1, uint8_t color)
     if (y1 >= height_) y1 = height_ - 1;
 
     for (int y = y0; y <= y1; y++) {
-        d_.RLCD_SetPixel((uint16_t)x, (uint16_t)y, color);
+        d_.punkt(x, y, color);
     }
 }
 
@@ -157,6 +157,20 @@ void Canvas::fill_rect(int x0, int y0, int x1, int y1, uint8_t color)
 
     for (int y = y0; y <= y1; y++) {
         hline(x0, x1, y, color);
+    }
+}
+
+void Canvas::bitmap(int x, int y, int w, int h, const uint8_t *bits)
+{
+    if (x == 0 && y == 0 && w == width_ && h == height_ && d_.vollbild(bits)) return;
+
+    const int bytes_je_zeile = (w + 7) / 8;
+    for (int j = 0; j < h; j++) {
+        const uint8_t *zeile = bits + j * bytes_je_zeile;
+        for (int i = 0; i < w; i++) {
+            const bool schwarz = (zeile[i / 8] & (0x80 >> (i % 8))) != 0;
+            pixel(x + i, y + j, schwarz ? ColorBlack : ColorWhite);
+        }
     }
 }
 

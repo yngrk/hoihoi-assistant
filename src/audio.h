@@ -140,6 +140,10 @@ class SpeakerOutput {
     void      stop();
     bool      running() const { return running_; }
 
+    // Effektivwert des zuletzt geschriebenen Blocks, fuer die Welle auf dem
+    // Display. 0, solange der Verstaerker aus ist.
+    int32_t pegel() const { return pegel_; }
+
     bool ready() const { return codec_ != nullptr; }
 
   private:
@@ -149,5 +153,6 @@ class SpeakerOutput {
     uint32_t               sample_rate_ = 0;
     int                    volume_  = 100;
     bool                   running_ = false;
+    volatile int32_t       pegel_   = 0;
     int16_t               *scratch_ = nullptr;   // kMaxFrames * kChannels
 };
