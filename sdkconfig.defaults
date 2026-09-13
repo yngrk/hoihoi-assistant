@@ -66,3 +66,6 @@ CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
 # ihn verdraengt, steht nur hier drin.
 CONFIG_FREERTOS_USE_TRACE_FACILITY=y
 CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
+
+# Schneller Code: TLS, lwIP und die Echounterdrueckung brauchen sonst Kern 1 fast allein
+CONFIG_COMPILER_OPTIMIZATION_PERF=y

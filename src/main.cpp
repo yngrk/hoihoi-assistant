@@ -22,6 +22,7 @@
 #include <esp_private/esp_clk.h>
 #include <driver/gpio.h>
 #include <driver/i2c_master.h>
+#include <driver/temperature_sensor.h>
 #include <esp_adc/adc_oneshot.h>
 #include <esp_adc/adc_cali.h>
 #include <esp_adc/adc_cali_scheme.h>
@@ -556,6 +557,7 @@ static volatile int32_t mic_pegel = 0;
 // Per KEY im Ruhezustand umgeschaltet. Das Mikrofon laeuft weiter — die
 // Echounterdrueckung braucht den Port —, aber das Weckwort bekommt nichts.
 static volatile int32_t mikro_stumm = 1;   // beim Start stumm, KEY schaltet
+static const bool       kWeckwort   = false;   // false: KEY startet die Frage, HoiHoi weckt nicht
 
 // Eine Antwort wurde per KEY abgebrochen, und gleich wird zugehoert — sobald
 // Lautsprecher und Wandler ausgeklungen sind. Die Anzeige springt schon jetzt
@@ -1403,6 +1405,22 @@ struct DunstEbene {
     float    tempo;         // Pixel je Takt
 };
 
+// Zweiter Zeichner: rechnet einen Teil der Bildzeilen auf dem anderen Kern.
+// Der Auftrag ist ein Funktionszeiger mit Kontext, gestartet und abgeholt
+// ueber zwei Semaphoren; die Zeilen beider Teile beruehren sich nicht.
+static SemaphoreHandle_t helfer_los = nullptr, helfer_fertig = nullptr;
+static void (*helfer_fn)(void *) = nullptr;
+static void *helfer_ctx = nullptr;
+
+static void helfer_task(void *)
+{
+    while (true) {
+        xSemaphoreTake(helfer_los, portMAX_DELAY);
+        helfer_fn(helfer_ctx);
+        xSemaphoreGive(helfer_fertig);
+    }
+}
+
 [[noreturn]] static void dunst_laufen(void)
 {
     const int B = display->width(), H = display->height(), BB = B / 8;
@@ -1753,6 +1771,17 @@ struct DunstEbene {
     int      fang_x0 = 0, fang_y0 = 0, fang_x1 = -1, fang_y1 = -1;       // eingefangene Szene
     int  auf_oben = H, auf_unten = -1;
     char auf_alt[96] = "";
+    // BOOT kurz (LIVE): untere Zeile der Pille zeigt CPU-Last, internen RAM und
+    // die Chiptemperatur statt des Wetters
+    bool  sys_zeigen = false;
+    int   sys_cpu = -1, sys_ram = -1;
+    float sys_temp = -1000;
+    temperature_sensor_handle_t temp_fuehler = nullptr;
+    {
+        temperature_sensor_config_t tc = TEMPERATURE_SENSOR_CONFIG_DEFAULT(10, 80);
+        if (temperature_sensor_install(&tc, &temp_fuehler) != ESP_OK || temperature_sensor_enable(temp_fuehler) != ESP_OK)
+            temp_fuehler = nullptr;
+    }
     const auto stempel = [&](float px, float py, float r, float rand) {
         const int R = (int)(r + rand + 1), cx = (int)px, cy = (int)py;
         for (int dy = -R; dy <= R; dy++) {
@@ -1795,6 +1824,13 @@ struct DunstEbene {
         { 22, 'L', 0, 5, 10, 5 }, { 22, 'A', 10, 2.5f, 2.5f, 2.5f, -90, 180 },
         { 22, 'L', 0, 9, 14, 9 }, { 22, 'A', 14, 6.5f, 2.5f, 2.5f, -90, 180 },
         { 22, 'L', 0, 13, 8, 13 }, { 22, 'A', 8, 15.5f, 2.5f, 2.5f, 90, -180 },
+        { 23, 'L', 3.5f, 3.5f, 12.5f, 3.5f }, { 23, 'L', 12.5f, 3.5f, 12.5f, 12.5f }, { 23, 'L', 12.5f, 12.5f, 3.5f, 12.5f },
+        { 23, 'L', 3.5f, 12.5f, 3.5f, 3.5f }, { 23, 'P', 8, 8, 1.3f },
+        { 23, 'L', 6.5f, 0.5f, 6.5f, 3 }, { 23, 'L', 9.5f, 0.5f, 9.5f, 3 }, { 23, 'L', 6.5f, 13, 6.5f, 15.5f }, { 23, 'L', 9.5f, 13, 9.5f, 15.5f },
+        { 23, 'L', 0.5f, 6.5f, 3, 6.5f }, { 23, 'L', 0.5f, 9.5f, 3, 9.5f }, { 23, 'L', 13, 6.5f, 15.5f, 6.5f }, { 23, 'L', 13, 9.5f, 15.5f, 9.5f },
+        { 24, 'L', 0.5f, 1.5f, 17.5f, 1.5f }, { 24, 'L', 17.5f, 1.5f, 17.5f, 9.5f }, { 24, 'L', 17.5f, 9.5f, 0.5f, 9.5f },
+        { 24, 'L', 0.5f, 9.5f, 0.5f, 1.5f }, { 24, 'L', 4, 4.5f, 4, 6.5f }, { 24, 'L', 9, 4.5f, 9, 6.5f }, { 24, 'L', 14, 4.5f, 14, 6.5f },
+        { 24, 'L', 3.5f, 10, 3.5f, 12.5f }, { 24, 'L', 7.5f, 10, 7.5f, 12.5f }, { 24, 'L', 11.5f, 10, 11.5f, 12.5f }, { 24, 'L', 15, 10, 15, 12.5f },
     };
     const auto zeichen = [&](int z, float ox, float oy, float k, float kStrich = 4.5f, float kRand = 2.5f) {
         for (const Zug &g : kZuege) {
@@ -1866,7 +1902,12 @@ struct DunstEbene {
         const wetter::Stand ws      = wetter::stand();
         char datum[40] = "", werte[40] = "", neu[96];
         if (zeit_ok) snprintf(datum, sizeof datum, "%s, %d. %s", kTage[lt.tm_wday], lt.tm_mday, kMonate[lt.tm_mon]);
-        if (ws.gueltig)
+        if (sys_zeigen) {
+            if (sys_cpu >= 0 && sys_temp > -100)
+                snprintf(werte, sizeof werte, "%d %%|%d %%|%d\xc2\xb0" "C", sys_cpu, sys_ram, (int)lround(sys_temp));
+            else if (sys_cpu >= 0)
+                snprintf(werte, sizeof werte, "%d %%|%d %%", sys_cpu, sys_ram);
+        } else if (ws.gueltig)
             snprintf(werte, sizeof werte, "%d\xc2\xb0|%d %%|%d km/h", (int)lround(ws.temp_c100 / 100.0),
                      (int)lround(ws.feuchte_100 / 100.0), (int)lround(ws.wind_kmh10 / 10.0));
         snprintf(neu, sizeof neu, "%d:%02d|%s|%s", zeit_ok ? lt.tm_hour : -1, lt.tm_min, datum, werte);
@@ -1890,11 +1931,19 @@ struct DunstEbene {
         // oben das Datum fett, darunter Symbol und Wert je Messgroesse
         glas_da = false;
         if (datum[0] || werte[0]) {
-            static const int kSymbol[3] = { 20, 21, 22 }, kSymbolB[3] = { 10, 10, 17 }, kSymbolH[3] = { 16, 15, 16 };
+            static const int kWetterS[3] = { 20, 21, 22 }, kWetterB[3] = { 10, 10, 17 }, kWetterH[3] = { 16, 15, 16 };
+            static const int kSystemS[3] = { 23, 24, 20 }, kSystemB[3] = { 16, 18, 10 }, kSystemH[3] = { 16, 13, 16 };
+            const int *const kSymbol = sys_zeigen ? kSystemS : kWetterS;
+            const int *const kSymbolB = sys_zeigen ? kSystemB : kWetterB;
+            const int *const kSymbolH = sys_zeigen ? kSystemH : kWetterH;
             char teil[3][16] = { "", "", "" };
+            int  teile = 0;
             if (werte[0]) {
                 const char *p = werte;
-                for (int i = 0; i < 3; i++) {
+                teile = 1;
+                for (const char *q = werte; *q; q++) teile += *q == '|';
+                if (teile > 3) teile = 3;
+                for (int i = 0; i < teile; i++) {
                     const char *e = strchr(p, '|');
                     const int   n = e ? (int)(e - p) : (int)strlen(p);
                     snprintf(teil[i], sizeof teil[i], "%.*s", n, p);
@@ -1904,7 +1953,7 @@ struct DunstEbene {
             const int bd = datum[0] ? ios_text(kSchriftFett, datum, 0, 0, false) : 0;
             int       bw = 0;
             if (werte[0])
-                for (int i = 0; i < 3; i++) bw += (i ? 14 : 0) + kSymbolB[i] + 4 + ios_text(kSchriftNormal, teil[i], 0, 0, false);
+                for (int i = 0; i < teile; i++) bw += (i ? 14 : 0) + kSymbolB[i] + 4 + ios_text(kSchriftNormal, teil[i], 0, 0, false);
             const int   lb  = bd > bw ? bd : bw;
             const float py0 = 124;
             const float py1 = py0 + 7 + (datum[0] ? kSchriftFett.hoehe : 0) + (datum[0] && werte[0] ? 2 : 0)
@@ -1949,7 +1998,7 @@ struct DunstEbene {
             }
             if (werte[0]) {
                 int x = B / 2 - bw / 2;
-                for (int i = 0; i < 3; i++) {
+                for (int i = 0; i < teile; i++) {
                     if (i) x += 14;
                     // Symbol unten knapp unter der Grundlinie
                     zeichen(kSymbol[i], (float)x, (float)(ty + kSchriftNormal.basis + 1 - kSymbolH[i]), 1.0f, 1.0f, 0.0f);
@@ -1982,6 +2031,15 @@ struct DunstEbene {
     int64_t takt = esp_timer_get_time(), ms_log = takt, rechnen_us = 0;
     int64_t teil_us[5] = {};   // Messung: Vorbereitung, Zeilen, Glas, Rest, Uebertragung
     int32_t takte = 0, zeit = 0;
+    // Unter der Teilung zeichnet der Helfer auf Kern 1 mit eigenem Zeilenring;
+    // die Teilung wandert dorthin, wo beide gleich lange brauchen
+    helfer_los    = xSemaphoreCreateBinary();
+    helfer_fertig = xSemaphoreCreateBinary();
+    const bool helfer_da = xTaskCreatePinnedToCoreWithCaps(helfer_task, "zeilen", 6144, nullptr, 3, nullptr, 1,
+                                                           MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) == pdPASS;
+    uint8_t (*const ring2)[400] = (uint8_t (*)[400])heap_caps_calloc(kBogen + 1, 400, MALLOC_CAP_SPIRAM);
+    int     teilung = 150;
+    int64_t teil_eigen_us = 0, teil_helfer_us = 0;
 
     while (true) {
         const int64_t jetzt = esp_timer_get_time();
@@ -2024,6 +2082,7 @@ struct DunstEbene {
                 etikett_bis = jetzt + 2500000;
             }
         } else {
+            if (taste) sys_zeigen = !sys_zeigen;
             u   = live_u();
             von = jetzt_l;   // Wetter zieht sanft nach, statt zu springen
         }
@@ -2081,6 +2140,31 @@ struct DunstEbene {
         wolken_versatz += 0.03f + w.wi * 0.012f;   // windstill kaum, bei 40 km/h gut ein halbes Pixel je Takt
         if (wolken_versatz >= kWeltB) wolken_versatz -= kWeltB;
 
+        {
+            static int64_t sys_zuletzt = 0;
+            if (jetzt - sys_zuletzt > 2000000) {
+                static TaskStatus_t *st = (TaskStatus_t *)heap_caps_calloc(32, sizeof(TaskStatus_t), MALLOC_CAP_SPIRAM);
+                static uint32_t      leer_vor[2] = {};
+                uint32_t             gesamt = 0, leer[2] = {};
+                const UBaseType_t    n = uxTaskGetSystemState(st, 32, &gesamt);
+                for (UBaseType_t i = 0; i < n; i++) {
+                    if (strcmp(st[i].pcTaskName, "IDLE0") == 0) leer[0] = st[i].ulRunTimeCounter;
+                    if (strcmp(st[i].pcTaskName, "IDLE1") == 0) leer[1] = st[i].ulRunTimeCounter;
+                }
+                if (sys_zuletzt > 0) {
+                    const int64_t dt   = (jetzt - sys_zuletzt) * 2;   // zwei Kerne, Laufzeit in Mikrosekunden
+                    const int64_t frei = (int64_t)(uint32_t)(leer[0] - leer_vor[0]) + (uint32_t)(leer[1] - leer_vor[1]);
+                    const int     last = 100 - (int)(frei * 100 / dt);
+                    sys_cpu = last < 0 ? 0 : (last > 100 ? 100 : last);
+                }
+                leer_vor[0] = leer[0]; leer_vor[1] = leer[1];
+                const size_t ganz = heap_caps_get_total_size(MALLOC_CAP_INTERNAL);
+                sys_ram = ganz ? 100 - (int)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) * 100 / ganz) : 0;
+                float grad;
+                if (temp_fuehler && temperature_sensor_get_celsius(temp_fuehler, &grad) == ESP_OK) sys_temp = grad;
+                sys_zuletzt = jetzt;
+            }
+        }
         auflage();
         const int64_t r0 = esp_timer_get_time();
         int ton[kEbenen], off[kEbenen];
@@ -2169,8 +2253,11 @@ struct DunstEbene {
         // y braucht die flachen Zeilen y - kBogen .. y, die in einem Ring liegen.
         // Erst beim Legen auf den Planeten wird gerastert, fest am Display, damit
         // die Kruemmung keine Muster in das Raster zieht
-        for (int y = 0; y < H; y++) {
-            uint8_t  *zt = ring[y % (kBogen + 1)];
+        // Zeilen [y_von, y_bis) mit dem Ring rg; die kBogen flachen Zeilen davor
+        // werden nur fuer den Ring gerechnet
+        const auto zeilen = [&](int y_von, int y_bis, uint8_t (*const rg)[400]) {
+        for (int y = y_von - kBogen < 0 ? 0 : y_von - kBogen; y < y_bis; y++) {
+            uint8_t  *zt = rg[y % (kBogen + 1)];
             const int dy = y - sy;
 
             memset(zt, himmel(y), B);
@@ -2252,6 +2339,7 @@ struct DunstEbene {
                 if (k == 1) maske(ebenen[1], turm, y, off[1], (uint8_t)((ton[1] + 4 > 16 ? 16 : ton[1] + 4) | 0x20), zt);
             }
 
+            if (y < y_von) continue;
             // Bildzeile y: jede Spalte sinkt um bogen[x], weiter oben wird breiter gezogen
             const uint8_t *bay = kBayer[y & 3];
             const int32_t  s   = zeile_s[y];
@@ -2267,7 +2355,7 @@ struct DunstEbene {
                 for (int b = 0; b < 8; b++, fx += s) {
                     const int x  = 8 * i + b;
                     const int fy = y - bogen[x];
-                    uint8_t t = fy < 0 ? oben : ring[fy % (kBogen + 1)][fx >> 16];
+                    uint8_t t = fy < 0 ? oben : rg[fy % (kBogen + 1)][fx >> 16];
                     if (fang) fz[x] = t;
                     if (ueber && !(t & 0x80)) {
                         // Ueber Sonne oder Mond steht die Uhr umgekehrt, ohne weissen Rand
@@ -2279,6 +2367,32 @@ struct DunstEbene {
                 }
                 z[i] = byte;
             }
+        }
+        };
+
+        if (helfer_da) {
+            int64_t    helfer_us = 0;
+            const auto arbeit    = [&]() {
+                const int64_t a = esp_timer_get_time();
+                zeilen(teilung, H, ring2);
+                helfer_us = esp_timer_get_time() - a;
+            };
+            helfer_ctx = (void *)&arbeit;
+            helfer_fn  = [](void *p) { (*static_cast<decltype(arbeit) *>(p))(); };
+            xSemaphoreGive(helfer_los);
+            const int64_t a = esp_timer_get_time();
+            zeilen(0, teilung, ring);
+            const int64_t eigen_us = esp_timer_get_time() - a;
+            xSemaphoreTake(helfer_fertig, portMAX_DELAY);
+            // Je groesser der Unterschied, desto weiter springt die Teilung
+            const int schritt = (int)((eigen_us > helfer_us ? eigen_us - helfer_us : helfer_us - eigen_us) / 400);
+            if (eigen_us > helfer_us + 1500) teilung -= schritt < 20 ? schritt : 20;
+            else if (helfer_us > eigen_us + 1500) teilung += schritt < 20 ? schritt : 20;
+            teilung = teilung < 20 ? 20 : (teilung > 290 ? 290 : teilung);
+            teil_eigen_us += eigen_us;
+            teil_helfer_us += helfer_us;
+        } else {
+            zeilen(0, H, ring);
         }
 
         teil_us[1] += esp_timer_get_time() - teil;
@@ -2595,7 +2709,7 @@ struct DunstEbene {
         {
             static const int kMitteX = 200, kMitteY = 45, kHalb = 30;
             const oberflaeche::Zustand zu    = ui_zustand();
-            const bool                 stumm = mikro_stumm != 0 && zu == oberflaeche::Zustand::Ruhe;
+            const bool                 stumm = (!kWeckwort || mikro_stumm != 0) && zu == oberflaeche::Zustand::Ruhe;
             static float anzeige = 0, phase = 0;
             const float  p = stumm ? 0.0f : (zu == oberflaeche::Zustand::Antwortet ? stimm_anteil() : mikro_anteil());
             anzeige = p > anzeige ? p : anzeige * 0.85f;   // schnell hoch, langsam zurueck
@@ -2693,9 +2807,34 @@ struct DunstEbene {
         teil_us[4] += esp_timer_get_time() - teil;
 
         if (++takte == 250) {
+            {
+                static TaskStatus_t *ts      = (TaskStatus_t *)heap_caps_calloc(32, sizeof(TaskStatus_t), MALLOC_CAP_SPIRAM);
+                static TaskStatus_t *vor     = (TaskStatus_t *)heap_caps_calloc(32, sizeof(TaskStatus_t), MALLOC_CAP_SPIRAM);
+                static UBaseType_t   vor_n   = 0;
+                static int64_t       vor_us  = 0;
+                uint32_t             gesamt  = 0;
+                const UBaseType_t    n       = uxTaskGetSystemState(ts, 32, &gesamt);
+                const int64_t        dt      = jetzt - vor_us;
+                char zeile[256];
+                int  p = snprintf(zeile, sizeof zeile, "Zustand %d:", (int)ui_zustand());
+                for (UBaseType_t i = 0; i < n && p < (int)sizeof zeile - 24; i++)
+                    for (UBaseType_t k = 0; k < vor_n; k++) {
+                        if (vor[k].xHandle != ts[i].xHandle) continue;
+                        const int proz = (int)((int64_t)(ts[i].ulRunTimeCounter - vor[k].ulRunTimeCounter) * 100 / (dt > 0 ? dt : 1));
+                        if (proz >= 3) p += snprintf(zeile + p, sizeof zeile - p, " %s=%d%%", ts[i].pcTaskName, proz);
+                        break;
+                    }
+                memcpy(vor, ts, n * sizeof(TaskStatus_t));
+                vor_n  = n;
+                vor_us = jetzt;
+                ESP_LOGI(TAG, "Dunst: %s", zeile);
+            }
             ESP_LOGI(TAG, "Dunst: %" PRId64 " ms je Takt, davon %" PRId64 " ms Rechnen; intern frei %u Byte.",
                      (jetzt - ms_log) / 1000 / takte, rechnen_us / 1000 / takte,
                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+            ESP_LOGI(TAG, "Dunst: Zeilen oben %d ms, unten %d ms, Teilung bei %d.", (int)(teil_eigen_us / 1000 / takte),
+                     (int)(teil_helfer_us / 1000 / takte), teilung);
+            teil_eigen_us = teil_helfer_us = 0;
             ESP_LOGI(TAG, "Dunst: Teile %d/%d/%d/%d ms, Bild %d ms.", (int)(teil_us[0] / 1000 / takte),
                      (int)(teil_us[1] / 1000 / takte), (int)(teil_us[2] / 1000 / takte), (int)(teil_us[3] / 1000 / takte),
                      (int)(teil_us[4] / 1000 / takte));
@@ -3021,7 +3160,10 @@ static bool visualize_mic(void)
     if (!kAnimationen) {
         // Stack im PSRAM, siehe Stt::begin(); gezeichnet wird in den
         // internen Bildpuffer, der Stack traegt nur Zahlen und Text.
-        xTaskCreatePinnedToCoreWithCaps(ui_task, "display", 8192, nullptr, 4, nullptr, 1,
+        // Kern 0 und Prioritaet 3: Kern 1 gehoert der Aufnahme, deren Echounterdrueckung
+        // waehrend einer Antwort ein Drittel davon braucht; auf Kern 0 steht die
+        // Stimme (tts_spiel, 4) weiter vor dem Bild
+        xTaskCreatePinnedToCoreWithCaps(ui_task, "display", 8192, nullptr, 3, nullptr, 0,
                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     } else if (wach.begin(wach_start, wach_ende) == ESP_OK && zu.begin(zu_start, zu_ende) == ESP_OK) {
         xTaskCreatePinnedToCore(display_task, "display", 4096, nullptr, 4, nullptr, 1);
@@ -3145,6 +3287,7 @@ static void audio_task(void *)
         static int64_t pruefung_ende = 0;
         static int64_t hoeren_seit   = 0;   // seit wann hoeren_gleich steht
         const int64_t  kPruefPauseUs = 1500000;
+        static int64_t stimme_zuletzt = 0;   // wann der Lautsprecher zuletzt lief
 
         if (!mic.running()) {
             mic.start();
@@ -3176,6 +3319,10 @@ static void audio_task(void *)
                         hoeren_gleich   = 0;
                         nachfrage_offen = false;
                         nachtrag::schreiben('I', TAG, "Taste: Zuhoeren abgebrochen.");
+                    } else if (!kWeckwort && z == oberflaeche::Zustand::Ruhe && !tts.spricht()) {
+                        listener.wecken(wachwort::ruhepegel());
+                        nachfrage_offen = false;
+                        nachtrag::schreiben('I', TAG, "Taste: hoert zu.");
                     } else if (z == oberflaeche::Zustand::Ruhe && !tts.spricht()) {
                         mikro_stumm     = !mikro_stumm;
                         nachfrage_offen = false;
@@ -3207,6 +3354,7 @@ static void audio_task(void *)
         }
 
         const bool antwort = tts.spricht();
+        if (antwort) stimme_zuletzt = esp_timer_get_time();
         if (antwort && !antwort_lief) {
             // Anschlagzaehler seit dem letzten Mal: das ist die Ruhe davor,
             // und darin muss MIC4 still sein und die Referenz fast auch —
@@ -3329,7 +3477,16 @@ static void audio_task(void *)
                 // stammt aus der Zeit unmittelbar vor dem Weckwort, und das
                 // ist die letzte, in der im Raum nachweislich niemand
                 // gesprochen hat.
-                if (mikro_stumm) {
+                if (!kWeckwort) {
+                    // Ohne Weckwort: nach einer Antwort (oder ihrem Abbruch per
+                    // Taste) wird noch kurz zugehoert, sobald der Lautsprecher
+                    // eine halbe Sekunde still ist und nicht mehr nachklingt
+                    if (nachfrage_offen && !listener.listening()
+                        && esp_timer_get_time() - stimme_zuletzt > 500000) {
+                        nachfrage_offen = false;
+                        listener.nachfragen(wachwort::ruhepegel());
+                    }
+                } else if (mikro_stumm) {
                     // Stumm: nichts weckt, nichts fragt nach.
                     nachfrage_offen = false;
                 } else if (!listener.listening()) {
