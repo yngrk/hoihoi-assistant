@@ -48,6 +48,18 @@ CONFIG_BT_BLUEDROID_ENABLED=n
 # gibt sie danach wieder her.
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
 
+# --- ... und diese Puffer aus dem PSRAM ---
+# Geholt wurden sie trotzdem im internen Speicher, und dort liegen waehrend
+# einer Antwort nur noch gut 50 KB frei, zerstueckelt vom offenen Wandler. In
+# der ersten Runde mit KI brach bei jeder Antwort einmal eine Verbindung ab:
+#
+#   Dynamic Impl: alloc(16749 bytes) failed
+#   esp-tls-mbedtls: read error :-0x7F00
+#
+# Traf es die Stimme, blieb die Ausgabe mitten im Satz stehen. Im PSRAM ist
+# fuer diese Puffer reichlich Platz, und fuer 24 kHz Ton ist er schnell genug.
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+
 # Laufzeitstatistik je Task. Gebraucht fuer den Stau-Melder in main.cpp: der
 # Aufnahmetask auf Kern 1 stand mehrfach ueber eine Sekunde still, obwohl er
 # mit Prioritaet 6 ueber allem liegt, was diese Firmware selbst anlegt. Wer

@@ -40,6 +40,21 @@ static const int64_t kSitzungWarteUs = 9 * 1000000;
 // Gegenstelle laufen.
 static const int64_t kAufbauPauseUs = 10 * 1000000;
 
+// "language" allein hat nicht gereicht: "Okay, cool" kam einmal als
+// koreanische Schrift zurueck, obwohl "de" gesetzt war. Kurze Aeusserungen mit
+// englischen Lehnwoertern geben dem Modell zu wenig, um die Sprache selbst zu
+// sehen. Der Hinweis gibt ihm den Zusammenhang, den die Aufnahme nicht hat.
+static const char *kHinweis =
+    "Gespraech mit einem Sprachassistenten auf Deutsch, gelegentlich mit "
+    "englischen Woertern wie okay oder cool.";
+
+// Die Kehrseite: bekommt das Modell fast nur Rauschen, gibt es den Hinweis
+// selbst als Text zurueck. Beobachtet nach einem Geraeusch in der Nachfrage —
+// und der Chat beantwortete ihn brav als Frage. Erkannt an einem Stueck, das
+// in keiner echten Frage vorkommt; Satzzeichen und Gross/klein darf das
+// Modell dabei aendern.
+static const char *kHinweisKern = "prachassistenten auf Deutsch";
+
 esp_err_t Stt::begin(Listener *quelle, uint32_t sample_rate,
                      const char *key, const char *model, const char *language)
 {
@@ -51,6 +66,8 @@ esp_err_t Stt::begin(Listener *quelle, uint32_t sample_rate,
 
     text_lock_ = xSemaphoreCreateMutex();
     if (text_lock_ == nullptr) return ESP_ERR_NO_MEM;
+    senden_lock_ = xSemaphoreCreateRecursiveMutex();
+    if (senden_lock_ == nullptr) return ESP_ERR_NO_MEM;
 
     if (key == nullptr || key[0] == '\0') {
         phase_ = (int32_t)Phase::Aus;
@@ -154,7 +171,18 @@ void Stt::ws_event(void *args, esp_event_base_t, int32_t id, void *event_data)
 
         case WEBSOCKET_EVENT_DISCONNECTED:
         case WEBSOCKET_EVENT_CLOSED:
+            // Wartet, bis ein laufender Schreibversuch durch ist, siehe
+            // send_json(). Danach sieht jeder weitere verbunden_ == 0.
+            //
+            // Rekursiv, weil das Ereignis auch aus dem Schreibversuch selbst
+            // kommen kann: scheitert er, baut der Client die Verbindung im
+            // Task des Schreibers ab und meldet es dort. Mit einer einfachen
+            // Sperre wartete der Task dann auf sich selbst — so stand die
+            // Erkennung einmal fuer immer still, und die Anzeige blieb bei
+            // der Aufnahme stehen.
+            xSemaphoreTakeRecursive(self->senden_lock_, portMAX_DELAY);
             self->verbunden_  = 0;
+            xSemaphoreGiveRecursive(self->senden_lock_);
             self->sitzung_ok_ = 0;
             self->ws_fehler_  = 1;
             break;
@@ -199,7 +227,20 @@ void Stt::on_message(const char *data, int len)
 
         } else if (strcmp(t, "conversation.item.input_audio_transcription.completed") == 0) {
             const cJSON *tr = cJSON_GetObjectItemCaseSensitive(root, "transcript");
-            if (cJSON_IsString(tr)) set_text(tr->valuestring);
+            const bool echo = cJSON_IsString(tr) && tr->valuestring != nullptr
+                              && strstr(tr->valuestring, kHinweisKern) != nullptr;
+            if (echo) {
+                ESP_LOGW(TAG, "Endtext ist der Hinweis selbst, verworfen: %s",
+                         tr->valuestring);
+                set_text("");
+            } else if (cJSON_IsString(tr) && pruefung_ && pruefer_ != nullptr
+                       && !pruefer_(tr->valuestring)) {
+                ESP_LOGI(TAG, "Pruefaufnahme verworfen, die Antwort laeuft weiter: %s",
+                         tr->valuestring);
+                set_text("");
+            } else if (cJSON_IsString(tr)) {
+                set_text(tr->valuestring);
+            }
 
             // Erst den Endtext sichern, dann den Zaehler hochsetzen: wer auf
             // den Zaehler wartet, findet den Text dann in jedem Fall schon
@@ -210,8 +251,10 @@ void Stt::on_message(const char *data, int len)
             final_seq_++;
 
             endtext_ = 1;
-            ESP_LOGI(TAG, "Endtext: %s",
-                     cJSON_IsString(tr) ? tr->valuestring : "(leer)");
+            if (!echo) {
+                ESP_LOGI(TAG, "Endtext: %s",
+                         cJSON_IsString(tr) ? tr->valuestring : "(leer)");
+            }
 
         } else if (strcmp(t, "session.updated") == 0
                    || strcmp(t, "transcription_session.updated") == 0) {
@@ -234,9 +277,27 @@ void Stt::on_message(const char *data, int len)
 bool Stt::send_json(const char *json)
 {
     if (client_ == nullptr) return false;
+
+    // Der Client baut eine Verbindung, die die Gegenseite schliesst, in
+    // seinem eigenen Task ab — beim Schliessen durch die Gegenseite sogar
+    // ohne seine Sperre. Wer in dem Moment schreibt, schreibt in einen
+    // freigegebenen TLS-Kontext: so stuerzte das Geraet ab, als eine
+    // Pruefaufnahme Ton schickte (LoadProhibited in ssl_check_ctr_renegotiate,
+    // aus send_audio). Das Ereignis dazu kommt vor dem Abbau und im selben
+    // Task an, und ws_event() wartet dort auf diese Sperre.
+    //
+    // Haelt der Client beim Abbau seine eigene Sperre, wartet dieser
+    // Schreibversuch darauf und gibt nach der Frist von 2 s auf — dann erst
+    // kommt das Ereignis durch. Das kostet im seltenen Fall zwei Sekunden,
+    // aber keinen Absturz.
+    xSemaphoreTakeRecursive(senden_lock_, portMAX_DELAY);
+    int       ret = -1;
     const int len = (int)strlen(json);
-    const int ret = esp_websocket_client_send_text(
-        (esp_websocket_client_handle_t)client_, json, len, pdMS_TO_TICKS(2000));
+    if (verbunden_) {
+        ret = esp_websocket_client_send_text(
+            (esp_websocket_client_handle_t)client_, json, len, pdMS_TO_TICKS(2000));
+    }
+    xSemaphoreGiveRecursive(senden_lock_);
     return ret == len;
 }
 
@@ -248,9 +309,10 @@ bool Stt::send_config()
              "{\"type\":\"session.update\",\"session\":{"
              "\"type\":\"transcription\",\"audio\":{\"input\":{"
              "\"format\":{\"type\":\"audio/pcm\",\"rate\":%u},"
-             "\"transcription\":{\"model\":\"%s\",\"language\":\"%s\"},"
+             "\"transcription\":{\"model\":\"%s\",\"language\":\"%s\","
+             "\"prompt\":\"%s\"},"
              "\"turn_detection\":null}}}}",
-             (unsigned)rate_, model_, lang_);
+             (unsigned)rate_, model_, lang_, kHinweis);
     return send_json(json_);
 }
 
@@ -381,6 +443,7 @@ void Stt::run()
             gesendet_       = 0;
             abschluss_offen = false;
             endtext_        = 0;
+            pruefung_       = quelle_->pruefung() ? 1 : 0;
             set_text("");
 
             if (client_ != nullptr && verbunden_ && sitzung_ok_) {

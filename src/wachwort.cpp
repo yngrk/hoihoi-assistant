@@ -45,7 +45,19 @@ int32_t  s_wort_blk  = 0;        // Laenge des laufenden Worts in Bloecken
 int32_t  s_wort_pk   = 0;        // Spitze darin
 int32_t  s_wort_rms  = 0;        // groesster Blockmittelwert darin
 uint32_t s_woerter   = 0;
-bool     s_geweckt   = false;    // Treffer, noch nicht abgeholt
+
+// Nach jedem Oeffnen des Mikrofons steht fuer rund 160 ms Vollausschlag an —
+// gemessen nach jeder der vier Antworten, Spitze 32767. Das ist der Wandler,
+// der sich nach dem Umkonfigurieren des Ports einschwingt, und kein Ton im
+// Raum. Er wurde bisher als Wort gezaehlt, verworfen, und riss dabei die
+// Abgrenzung fuer den Augenblick an sich, in dem am ehesten jemand das
+// Weckwort sagt: gleich nach einer Antwort.
+//
+// 300 ms statt 160, weil das Ende des Einschwingers nicht scharf ist. Wie viel
+// davon wirklich gebraucht wird, steht nach jedem Oeffnen im Log.
+const int32_t kEinschwingBloecke = 15;
+int32_t s_einschwing    = 0;   // Bloecke, die noch uebersprungen werden
+int32_t s_einschwing_pk = 0;   // Spitze darin
 
 // --- Merkmale --------------------------------------------------------------
 //
@@ -100,19 +112,19 @@ int32_t rahmen_bei(int64_t abtast)
     return (int32_t)r;
 }
 
-// Der Kandidat wird mittelwertbefreit: von jedem Koeffizienten wird sein
-// Mittel ueber das Wort abgezogen. Das nimmt heraus, was ueber das ganze Wort
-// gleich bleibt — Mikrofon, Abstand zum Mund, Raum — und uebrig bleibt, wie
-// sich der Klang veraendert. Genau darauf kommt es an.
-bool kandidat_pruefen(int32_t von, int32_t bis, int32_t ms)
+// Der Kandidat geht roh an den Vergleich. Die Mittelwertbefreiung stand
+// frueher hier; sie ist jetzt dort, weil der Vergleich sie auf mehrere Arten
+// probiert, siehe vergleich.h. Gerechnet wird in dessen eigenem Task — hier
+// wird nur kopiert.
+void kandidat_pruefen(int32_t von, int32_t bis, int32_t ms)
 {
-    if (s_ring == nullptr || s_folge == nullptr) return false;
+    if (s_ring == nullptr || s_folge == nullptr) return;
 
     if (von < s_rahmen_nr - kRing + 1) von = s_rahmen_nr - kRing + 1;
     if (von < 0) von = 0;
 
     const int32_t n = bis - von;
-    if (n < 8 || n > vergleich::kMaxRahmen) return false;
+    if (n < 8 || n > vergleich::kMaxRahmen) return;
 
     for (int32_t i = 0; i < n; i++) {
         memcpy(s_folge + (size_t)i * merkmal::kKoeff,
@@ -120,14 +132,9 @@ bool kandidat_pruefen(int32_t von, int32_t bis, int32_t ms)
                merkmal::kKoeff * sizeof(float));
     }
 
-    for (int k = 0; k < merkmal::kKoeff; k++) {
-        float s = 0.0f;
-        for (int32_t i = 0; i < n; i++) s += s_folge[(size_t)i * merkmal::kKoeff + k];
-        const float m = s / (float)n;
-        for (int32_t i = 0; i < n; i++) s_folge[(size_t)i * merkmal::kKoeff + k] -= m;
+    if (!vergleich::einreichen(s_folge, n, ms)) {
+        nachtrag::schreiben('W', TAG, "  Kandidat verworfen: der vorige wird noch verglichen.");
     }
-
-    return vergleich::kandidat(s_folge, n, ms);
 }
 
 void wort_abschliessen(int32_t blockframes)
@@ -143,7 +150,7 @@ void wort_abschliessen(int32_t blockframes)
                             (int)s_wort_rms, (int)s_ruhe);
 
         const int32_t bis = rahmen_bei(s_abtast - (int64_t)kEndeBloecke * blockframes);
-        if (kandidat_pruefen(s_wort_von, bis, ms)) s_geweckt = true;
+        kandidat_pruefen(s_wort_von, bis, ms);
     } else {
         // Verworfen ist hier keine Nebensache: zu lang heisst, zwei Woerter
         // sind zusammengelaufen, zu kurz heisst, eines ist auseinandergefallen.
@@ -218,6 +225,28 @@ void wachwort::feed(const int16_t *pcm, size_t frames, uint32_t rate)
 {
     if (pcm == nullptr || frames == 0 || rate == 0) return;
 
+    if (s_einschwing > 0) {
+        for (size_t i = 0; i < frames; i++) {
+            const int32_t a = (pcm[i] < 0) ? -(int32_t)pcm[i] : (int32_t)pcm[i];
+            if (a > s_einschwing_pk) s_einschwing_pk = a;
+        }
+        if (--s_einschwing > 0) return;
+
+        // Die letzte Zahl ist die, auf die es ankommt: liegt die Spitze des
+        // letzten verworfenen Blocks noch weit ueber der Ruhe, reichen die
+        // 300 ms nicht.
+        int32_t letzte = 0;
+        for (size_t i = 0; i < frames; i++) {
+            const int32_t a = (pcm[i] < 0) ? -(int32_t)pcm[i] : (int32_t)pcm[i];
+            if (a > letzte) letzte = a;
+        }
+        nachtrag::schreiben('I', TAG, "Eingeschwungen: %d ms verworfen, Spitze darin %d, "
+                                      "im letzten Block %d, Ruhe %d.",
+                            (int)(kEinschwingBloecke * kBlockMs), (int)s_einschwing_pk,
+                            (int)letzte, (int)s_ruhe);
+        return;
+    }
+
     rahmen_fuettern(pcm, frames);
     s_abtast += (int64_t)frames;
 
@@ -268,12 +297,9 @@ void wachwort::feed(const int16_t *pcm, size_t frames, uint32_t rate)
     }
 }
 
-bool wachwort::geweckt()
-{
-    const bool g = s_geweckt;
-    s_geweckt = false;
-    return g;
-}
+bool wachwort::geweckt() { return vergleich::geweckt(); }
+
+bool wachwort::eingeschwungen() { return s_einschwing == 0; }
 
 int32_t wachwort::ruhepegel() { return s_ruhe; }
 int32_t wachwort::schwelle()  { return s_ruhe * kFaktor + kBoden; }
@@ -287,8 +313,15 @@ void wachwort::ruhe()
     s_wort_rms = 0;
     s_laut     = 0;
     s_still    = 0;
-    s_ruhe     = kBoden;
-    s_geweckt  = false;
+
+    // Der Ruhepegel bleibt stehen. Frueher ging er hier auf den Boden zurueck,
+    // und die Schwelle stand damit nach jeder Antwort bei 300 statt bei rund
+    // 120 — ein leise angesetztes "HoiHoi" verlor sein H, und genau die beiden
+    // Fehlversuche der letzten Testrunde lagen dort. Der Raum ist waehrend
+    // einer Antwort derselbe geblieben; der Wert davor ist der beste, den es
+    // gibt.
+    s_einschwing    = kEinschwingBloecke;
+    s_einschwing_pk = 0;
 
     // Was vor der Pause halb im Puffer stand, gehoert zu keinem Rahmen mehr.
     s_fuell = 0;

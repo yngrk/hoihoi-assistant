@@ -31,6 +31,7 @@
 #include "gfx.h"
 #include "font5x7.h"
 #include "audio.h"
+#include "echo.h"
 #include "listen.h"
 #include "nachtrag.h"
 #include "vergleich.h"
@@ -469,7 +470,19 @@ static const uint32_t kSampleRate = 24000;
 // Signal ueber die volle Bildbreite.
 static const int kFramesPerColumn = 60;
 static const int kColumnsPerRead  = 8;
+// true: keine Anfragen an OpenAI, siehe visualize_mic(). Nur fuer Tests des
+// Weckworts — im Betrieb false.
+static const bool kOhneKi = false;
+
 static const int kReadFrames      = kFramesPerColumn * kColumnsPerRead;   // 480 = 20 ms
+
+// Verstaerkung der Mikrofone sonst und waehrend einer Antwort. Der
+// Lautsprecher sitzt im selben Gehaeuse; mit 37,5 dB laeuft sein Echo an den
+// Anschlag, und ein abgeschnittenes Echo ist nicht mehr das, was die
+// Referenz zeigt — es laesst sich nicht abziehen. Ob 7,5 dB weniger reichen,
+// zeigen die Anschlagzaehler am Ende jeder Antwort.
+static const float kMicDb        = 37.5f;
+static const float kMicDbAntwort = 30.0f;
 
 // Geteilter Zustand zwischen Aufnahme- und Anzeigetask.
 static SemaphoreHandle_t scope_lock = nullptr;
@@ -639,29 +652,41 @@ static void draw_weckwort(int32_t rms)
 
     // --- Einlernen laeuft ---
     if (vergleich::lernt()) {
-        text_mitte(40, "SAG HOIHOI", kWachGross);
-
-        // Vier Kaesten, gefuellt was steht. Eine Zahl allein ("2 von 4") muss
-        // gelesen werden; die Kaesten sieht man im Vorbeigehen.
         const int fertig = vergleich::eingelernt();
-        const int breite = 72;
-        const int luecke = 16;
+        const bool nah   = fertig < vergleich::kJeLage;
+
+        text_mitte(36, "SAG HOIHOI", kWachGross);
+
+        // Die Lage steht invers: wer beim fuenften Mal nicht weggeht, lernt
+        // dieselbe Lage zweimal ein, und genau das soll nicht passieren.
+        const char *lage = nah ? "NAH AM GERAET" : "JETZT AUS ETWA 2 M";
+        const int   lw   = Canvas::text_width(lage, kWachKlein);
+        display->fill_rect((LCD_WIDTH - lw) / 2 - 6, 76, (LCD_WIDTH + lw) / 2 + 5, 97,
+                           ColorBlack);
+        display->text((LCD_WIDTH - lw) / 2, 80, lage, ColorWhite, kWachKlein);
+
+        // Acht Kaesten in zwei Gruppen, gefuellt was steht. Eine Zahl allein
+        // ("5 von 8") muss gelesen werden; die Kaesten sieht man im
+        // Vorbeigehen, und die Gruppen zeigen die beiden Lagen.
+        const int breite = 34;
+        const int luecke = 8;
+        const int gruppe = 28;
         const int ganz   = vergleich::kVorlagen * breite
-                           + (vergleich::kVorlagen - 1) * luecke;
+                           + (vergleich::kVorlagen - 2) * luecke + gruppe;
         int       x      = (LCD_WIDTH - ganz) / 2;
 
         for (int i = 0; i < vergleich::kVorlagen; i++) {
             if (i < fertig) {
-                display->fill_rect(x, 110, x + breite - 1, 155, ColorBlack);
+                display->fill_rect(x, 112, x + breite - 1, 152, ColorBlack);
             } else {
-                display->rect(x, 110, x + breite - 1, 155, ColorBlack);
+                display->rect(x, 112, x + breite - 1, 152, ColorBlack);
             }
-            x += breite + luecke;
+            x += breite + ((i == vergleich::kJeLage - 1) ? gruppe : luecke);
         }
 
-        snprintf(buf, sizeof(buf), "NOCH %d MAL - MIT PAUSEN DAZWISCHEN",
+        snprintf(buf, sizeof(buf), "NOCH %d MAL, MIT PAUSEN",
                  vergleich::kVorlagen - fertig);
-        text_mitte(175, buf, kWachKlein);
+        text_mitte(172, buf, kWachKlein);
 
         draw_pegel(rms);
         return;
@@ -671,8 +696,8 @@ static void draw_weckwort(int32_t rms)
     if (vergleich::eingelernt() == 0) {
         text_mitte(36, "BOOT LANG", kWachGross);
         text_mitte(80, "HALTEN", kWachGross);
-        text_mitte(146, "DANN VIERMAL HOIHOI SAGEN,", kWachKlein);
-        text_mitte(168, "MIT PAUSEN DAZWISCHEN", kWachKlein);
+        text_mitte(146, "DANN ACHTMAL HOIHOI SAGEN:", kWachKlein);
+        text_mitte(168, "4 NAH, 4 AUS 2 M ABSTAND", kWachKlein);
 
         draw_pegel(rms);
         return;
@@ -707,7 +732,7 @@ static void draw_weckwort(int32_t rms)
 
         // Balken von null bis kSkala100, mit der Schwelle als Strich. Die
         // Zahl allein sagt nicht, ob 10,9 knapp daneben oder weit weg ist.
-        const int32_t kSkala100 = 1600;
+        const int32_t kSkala100 = 2400;
         const int     leiste_o  = 150;
         const int     leiste_u  = 172;
 
@@ -737,6 +762,151 @@ static void draw_weckwort(int32_t rms)
     snprintf(buf, sizeof(buf), "%u VON %u WOERTERN WAREN DAS WECKWORT",
              (unsigned)vergleich::treffer(), (unsigned)vergleich::bewertet());
     display->text(kWachX, 200, buf, ColorBlack, kWachKlein);
+
+    draw_pegel(rms);
+}
+
+// Die Testansicht. Sie beantwortet eine einzige Frage — trennt eine der beiden
+// Arten "HoiHoi" von den Stoerern? — und zeigt dazu nur, was man waehrend
+// des Sprechens braucht: was als Naechstes gezaehlt wird, was das letzte Wort
+// ergab, und je Art die beiden Grenzwerte mit der Luecke dazwischen.
+//
+// Die Luecke steht in Prozent des schlechtesten HoiHoi und nicht als Differenz.
+// Die Arten haben verschiedene Massstaebe — mit festem Mittel ist jeder
+// Abstand groesser —, und nur ein relatives Mass ist zwischen den Zeilen
+// vergleichbar.
+static void fmt_abstand(char *buf, size_t n, int32_t d100)
+{
+    if (d100 < 0) {
+        snprintf(buf, n, "-");
+    } else {
+        snprintf(buf, n, "%d.%d", (int)(d100 / 100), (int)((d100 / 10) % 10));
+    }
+}
+
+static void draw_test(int32_t rms)
+{
+    char buf[48];
+
+    // Einlernen und "noch nichts eingelernt" sehen aus wie im Betrieb.
+    if (vergleich::lernt() || vergleich::eingelernt() == 0) {
+        draw_weckwort(rms);
+        return;
+    }
+
+    draw_header("WECKWORT-TEST, KI AUS", "KEY: MARKE  LANG: LEEREN");
+
+    // --- Marke und Zustand ---
+    display->text(kWachX, 22, "JETZT SAGEN", ColorBlack, 1);
+    display->text(kWachX, 34, vergleich::marke_name(vergleich::marke()), ColorBlack, 4);
+
+    const int kasten_l = 238;
+    const int kasten_r = LCD_WIDTH - kWachX - 1;
+    if (listener.listening()) {
+        // Aufgewacht. Im Test heisst das: schweigen, bis es von selbst
+        // abbricht — und die Sekunden zeigen, dass es das auch tut.
+        display->fill_rect(kasten_l, 24, kasten_r, 62, ColorBlack);
+        const char *oben = "WACH - SCHWEIGEN";
+        display->text((kasten_l + kasten_r - Canvas::text_width(oben, 1)) / 2, 30,
+                      oben, ColorWhite, 1);
+        const int32_t ms = listener.elapsed_ms();
+        snprintf(buf, sizeof(buf), "%d.%d S", (int)(ms / 1000), (int)((ms / 100) % 10));
+        display->text((kasten_l + kasten_r - Canvas::text_width(buf, 2)) / 2, 42,
+                      buf, ColorWhite, 2);
+    } else {
+        display->rect(kasten_l, 24, kasten_r, 62, ColorBlack);
+        const char *z = wachwort::im_wort() ? "HOERT ..." : "BEREIT";
+        display->text((kasten_l + kasten_r - Canvas::text_width(z, 2)) / 2, 36,
+                      z, ColorBlack, 2);
+    }
+
+    // --- Tabelle ---
+    const int x_art   = kWachX;
+    const int x_letzt = 104;
+    const int x_hoi   = 180;
+    const int x_fremd = 256;
+    const int x_luck  = 332;
+    const int y_kopf  = 72;
+
+    display->text(x_art,   y_kopf, "ART", ColorBlack, 1);
+    display->text(x_letzt, y_kopf, "LETZTES", ColorBlack, 1);
+    display->text(x_hoi,   y_kopf, "HOI MAX", ColorBlack, 1);
+    display->text(x_fremd, y_kopf, "FREMD MIN", ColorBlack, 1);
+    display->text(x_luck,  y_kopf, "LUECKE", ColorBlack, 1);
+    display->hline(kWachX, LCD_WIDTH - kWachX - 1, y_kopf + 10, ColorBlack);
+
+    static const char *kArtKurz[vergleich::kArten] = { "WORT", "FEST" };
+
+    for (int art = 0; art < vergleich::kArten; art++) {
+        const int y = 88 + art * 20;
+
+        // Die Zeile, nach der ausgeloest wird, traegt ihren Namen invers.
+        if (art == vergleich::kAusloeser) {
+            display->fill_rect(x_art - 3, y - 3,
+                               x_art + Canvas::text_width(kArtKurz[art], 2) + 2, y + 16,
+                               ColorBlack);
+            display->text(x_art, y, kArtKurz[art], ColorWhite, 2);
+        } else {
+            display->text(x_art, y, kArtKurz[art], ColorBlack, 2);
+        }
+
+        fmt_abstand(buf, sizeof(buf), vergleich::letzt_art(art));
+        display->text(x_letzt, y, buf, ColorBlack, 2);
+
+        const int32_t hoi   = vergleich::hoi_max(art);
+        const int32_t fremd = vergleich::fremd_min(art);
+        fmt_abstand(buf, sizeof(buf), hoi);
+        display->text(x_hoi, y, buf, ColorBlack, 2);
+        fmt_abstand(buf, sizeof(buf), fremd);
+        display->text(x_fremd, y, buf, ColorBlack, 2);
+
+        if (hoi > 0 && fremd >= 0) {
+            const int32_t prozent = (fremd - hoi) * 100 / hoi;
+            snprintf(buf, sizeof(buf), "%+d%%", (int)prozent);
+
+            // Eine offene Luecke steht invers: das ist die Zeile, nach der
+            // man sucht, und sie soll aus zwei Metern zu sehen sein.
+            if (prozent > 0) {
+                display->fill_rect(x_luck - 3, y - 3, LCD_WIDTH - kWachX - 1, y + 16,
+                                   ColorBlack);
+                display->text(x_luck, y, buf, ColorWhite, 2);
+            } else {
+                display->text(x_luck, y, buf, ColorBlack, 2);
+            }
+        } else {
+            display->text(x_luck, y, "-", ColorBlack, 2);
+        }
+    }
+
+    // --- Letztes Wort ---
+    const int lm = vergleich::letzt_marke();
+    if (lm < 0) {
+        snprintf(buf, sizeof(buf), "NOCH KEIN WORT BEWERTET");
+    } else if (vergleich::letzt_art(vergleich::kWort) < 0) {
+        snprintf(buf, sizeof(buf), "LETZTES: %s, %d MS - LAENGE PASST NICHT",
+                 vergleich::marke_name(lm), (int)vergleich::letzte_dauer());
+    } else {
+        snprintf(buf, sizeof(buf), "LETZTES: %s, %d MS%s", vergleich::marke_name(lm),
+                 (int)vergleich::letzte_dauer(),
+                 vergleich::letzter_treffer() ? " - HAETTE GEWECKT" : "");
+    }
+    display->text(kWachX, 172, buf, ColorBlack, 1);
+
+    // --- Zaehler ---
+    display->hline(kWachX, LCD_WIDTH - kWachX - 1, 186, ColorBlack);
+    display->text(kWachX, 192, "GEWECKT / GESAGT", ColorBlack, 1);
+    static const char *kKurz[vergleich::kMarken] = { "HOI", "HA", "HE", "HO" };
+    // Zweistellige Zaehler passen in Schrift 2 nicht mehr nebeneinander; dann
+    // lieber klein als abgeschnitten.
+    char zeile[64];
+    int  n = 0;
+    for (int m = 0; m < vergleich::kMarken; m++) {
+        n += snprintf(&zeile[n], sizeof(zeile) - n, "%s%s %u/%u", m ? "  " : "",
+                      kKurz[m], (unsigned)vergleich::aufgewacht(m),
+                      (unsigned)vergleich::gesagt(m));
+    }
+    const int zs = (Canvas::text_width(zeile, 2) <= LCD_WIDTH - 2 * kWachX) ? 2 : 1;
+    display->text(kWachX, 206, zeile, ColorBlack, zs);
 
     draw_pegel(rms);
 }
@@ -840,7 +1010,9 @@ static void draw_listening(void)
 
     snprintf(buf, sizeof(buf), "%d.%d s / %d s",
              (int)(ms / 1000), (int)((ms / 100) % 10), Listener::kMaxSeconds);
-    draw_header(hoert ? "AUFNAHME" : "AUFNAHME BEENDET", buf);
+    draw_header(hoert ? (listener.nachfrage() ? "NACHFRAGE?" : "AUFNAHME")
+                      : "AUFNAHME BEENDET",
+                buf);
 
     // Aufnahmezeichen: gefuellter Punkt, im Sekundentakt blinkend. Das
     // Blinken ist der Teil, der auch aus dem Augenwinkel ankommt — ein
@@ -987,13 +1159,13 @@ static void draw_answer(void)
     // Die Frage klein darueber: ohne sie steht die Antwort ohne Bezug da, und
     // bei einer falsch verstandenen Frage ist genau das die Erklaerung.
     chat.copy_frage(frage, sizeof(frage));
-    if (frage[0] != ' ') {
+    if (frage[0] != '\0') {
         display->text_wrapped(kColLeftX, kFrageY, LCD_WIDTH - 2 * kColLeftX,
                               frage, ColorBlack, 1, kFrageStep, kFrageLines);
     }
 
     chat.copy_antwort(antwort, sizeof(antwort));
-    if (antwort[0] != ' ') {
+    if (antwort[0] != '\0') {
         display->text_wrapped(kColLeftX, kAntwortY, LCD_WIDTH - 2 * kColLeftX,
                               antwort, ColorBlack, kTextScale, kTextStep,
                               kAntwortLines);
@@ -1039,6 +1211,14 @@ static void draw_scope(const int16_t *lo, const int16_t *hi, int head,
                        int32_t scale, int32_t rms, int32_t peak)
 {
     display->clear(ColorWhite);
+
+    // Im Testbetrieb gibt es keine Antwort, und die Aufnahme ist nur der
+    // Beweis, dass geweckt wurde — beides zeigt die Testansicht selbst.
+    if (kOhneKi && !net::provisioning()) {
+        draw_test(rms);
+        display->flush();
+        return;
+    }
 
     // Die laufende Aufnahme geht allem vor. Die Antwort bleibt nach dem
     // letzten Wort noch acht Sekunden stehen, damit man sie lesen kann — wer
@@ -1252,6 +1432,99 @@ static void stau_melden(int luecke_ms, int vor_ms, int lesen_ms, int nach_ms)
                         luecke_ms, vor_ms, lesen_ms, nach_ms, zeile);
 }
 
+// --- Hineinsprechen: Worte oder nicht? --------------------------------------
+//
+// Die Pruefaufnahme aus echo.h kommt hier mit ihrem Endtext an. Zwei Dinge
+// sollen nicht als Hineinsprechen gelten:
+//
+//   - Geraeusche. Die Erkennung macht daraus meist gar keinen Text, manchmal
+//     ein "Hm". Verlangt wird deshalb mindestens ein Wort mit drei Zeichen.
+//   - Das eigene Echo. Was die Echounterdrueckung durchlaesst, ist die Stimme
+//     der Antwort, und die Erkennung schreibt es brav mit — im ersten Test
+//     kam so "Leute haben daran gearbeitet." zustande. Solcher Text steht
+//     in der Antwort, und zwar Wort fuer Wort in derselben Reihenfolge. Eine
+//     echte Zwischenfrage kann einzelne Worte der Antwort enthalten, drei in
+//     Folge aber kaum.
+
+struct Wortstelle {
+    size_t von;
+    size_t len;
+};
+
+static bool ist_buchstabe(char c)
+{
+    const unsigned char u = (unsigned char)c;
+    return (u >= 'a' && u <= 'z') || (u >= 'A' && u <= 'Z') || (u >= '0' && u <= '9')
+           || u >= 0x80;   // Umlaute und alles andere aus UTF-8 zaehlt mit
+}
+
+// Zerlegt s in Worte und schreibt es dabei klein (nur ASCII; Umlaute kommen
+// von der Erkennung und aus dem Chat gleich geschrieben).
+static int worte_zerlegen(char *s, Wortstelle *w, int max)
+{
+    int    n = 0;
+    size_t i = 0;
+    while (s[i] != '\0' && n < max) {
+        while (s[i] != '\0' && !ist_buchstabe(s[i])) i++;
+        const size_t a = i;
+        while (s[i] != '\0' && ist_buchstabe(s[i])) {
+            if (s[i] >= 'A' && s[i] <= 'Z') s[i] = (char)(s[i] - 'A' + 'a');
+            i++;
+        }
+        if (i > a) w[n++] = {a, i - a};
+    }
+    return n;
+}
+
+static bool wort_gleich(const char *a, const Wortstelle &x, const char *b, const Wortstelle &y)
+{
+    return x.len == y.len && memcmp(a + x.von, b + y.von, x.len) == 0;
+}
+
+// Laeuft im WebSocket-Task der Erkennung, siehe Stt::pruefer().
+static bool hineingesprochen(const char *text)
+{
+    static char       satz[Stt::kMaxText];
+    static char       antwort[Chat::kMaxAntwort];
+    static Wortstelle sw[64];
+    static Wortstelle aw[256];
+
+    snprintf(satz, sizeof(satz), "%s", text);
+    chat.copy_antwort(antwort, sizeof(antwort));
+    const int ns = worte_zerlegen(satz, sw, 64);
+    const int na = worte_zerlegen(antwort, aw, 256);
+
+    int lang = 0;
+    for (int i = 0; i < ns; i++) {
+        if (sw[i].len >= 3) lang++;
+    }
+
+    // Die laengste Folge von Worten, die genau so auch in der Antwort steht.
+    int folge = 0;
+    for (int i = 0; i < ns; i++) {
+        for (int j = 0; j < na; j++) {
+            int k = 0;
+            while (i + k < ns && j + k < na
+                   && wort_gleich(satz, sw[i + k], antwort, aw[j + k])) {
+                k++;
+            }
+            if (k > folge) folge = k;
+        }
+    }
+
+    const bool leer = (lang == 0);
+    const bool echo = !leer && (folge >= 3 || (ns <= 2 && folge == ns) || folge * 10 >= ns * 6);
+
+    ESP_LOGI(TAG, "Pruefaufnahme: %d Worte, %d davon ab drei Zeichen, %d in Folge aus "
+                  "der Antwort — %s.",
+             ns, lang, folge,
+             leer ? "keine Worte" : echo ? "Echo der Antwort" : "hineingesprochen");
+
+    if (leer || echo) return false;
+    tts.abbrechen();
+    return true;
+}
+
 // Richtet alles ein, was zum Aufnehmen, Erkennen, Antworten und Sprechen
 // gehoert, und uebergibt den Takt danach an audio_task(). true heisst: es
 // laeuft, der Haupttask wird nicht mehr gebraucht.
@@ -1259,7 +1532,7 @@ static bool visualize_mic(void)
 {
     ESP_LOGI(TAG, "--- Mikrofon-Visualisierung ---");
 
-    if (mic.begin(i2c_bus, kSampleRate) != ESP_OK) {
+    if (mic.begin(i2c_bus, kSampleRate, kMicDb) != ESP_OK) {
         ESP_LOGE(TAG, "  Mikrofon nicht verfuegbar, Visualisierung entfaellt.");
         return false;
     }
@@ -1292,16 +1565,31 @@ static bool visualize_mic(void)
                  esp_err_to_name(lerr));
     }
 
+    // Fuer Weckwort-Tests: Erkennung, Chat und Stimme bleiben aus. Wer
+    // zwanzigmal "ha ha" sagt, um Fehlausloesungen zu zaehlen, will dafuer
+    // nicht zwanzig Transkriptionen bezahlen — und jede ausgeloeste Aufnahme
+    // schickt auch drei Sekunden Stille zur Erkennung. Aufgenommen wird
+    // trotzdem, damit Abbruch und Satzende weiter zu sehen sind.
+    //
+    // Umgesetzt als leerer Schluessel: das ist der Weg, den alle drei ohnehin
+    // sauber gehen, wenn secrets.h fehlt.
+    const char *const ki_schluessel = kOhneKi ? "" : OPENAI_API_KEY;
+    if (kOhneKi) {
+        ESP_LOGW(TAG, "  kOhneKi: Erkennung, Chat und Stimme bleiben aus, "
+                      "keine Anfragen an OpenAI.");
+    }
+
     // Spracherkennung. Ohne Schluessel oder ohne WLAN bleibt sie aus, und
     // alles andere laeuft unveraendert weiter — die Firmware soll auch auf
     // einem Geraet ohne secrets.h benutzbar bleiben.
     const esp_err_t serr = stt.begin(&listener, mic.sample_rate(),
-                                     OPENAI_API_KEY, STT_MODEL, STT_LANGUAGE);
+                                     ki_schluessel, STT_MODEL, STT_LANGUAGE);
     if (serr == ESP_OK) {
+        stt.pruefer(&hineingesprochen);
         ESP_LOGI(TAG, "  Transkription aktiv: %s, Sprache %s.",
                  STT_MODEL, STT_LANGUAGE);
     } else if (serr == ESP_ERR_INVALID_ARG) {
-        ESP_LOGW(TAG, "  Kein OPENAI_API_KEY in secrets.h — es wird "
+        if (!kOhneKi) ESP_LOGW(TAG, "  Kein OPENAI_API_KEY in secrets.h — es wird "
                       "aufgenommen, aber nicht erkannt.");
     } else {
         ESP_LOGE(TAG, "  Transkription nicht gestartet (%s).",
@@ -1310,11 +1598,11 @@ static bool visualize_mic(void)
 
     // Antwort auf die erkannte Frage. Haengt am Stt und braucht denselben
     // Schluessel; ohne ihn bleibt es bei Aufnahme und Transkript.
-    const esp_err_t cerr = chat.begin(&stt, OPENAI_API_KEY, CHAT_MODEL);
+    const esp_err_t cerr = chat.begin(&stt, ki_schluessel, CHAT_MODEL);
     if (cerr == ESP_OK) {
         ESP_LOGI(TAG, "  Chat aktiv: %s.", CHAT_MODEL);
     } else if (cerr == ESP_ERR_INVALID_ARG) {
-        ESP_LOGW(TAG, "  Kein OPENAI_API_KEY in secrets.h — keine Antworten.");
+        if (!kOhneKi) ESP_LOGW(TAG, "  Kein OPENAI_API_KEY in secrets.h — keine Antworten.");
     } else {
         ESP_LOGE(TAG, "  Chat nicht gestartet (%s).", esp_err_to_name(cerr));
     }
@@ -1342,11 +1630,11 @@ static bool visualize_mic(void)
 
     // Sprachausgabe zuletzt: sie braucht den Lautsprecher und haengt am Chat.
     const esp_err_t terr = tts.begin(&chat, &speaker, &listener,
-                                     OPENAI_API_KEY, TTS_MODEL, TTS_VOICE);
+                                     ki_schluessel, TTS_MODEL, TTS_VOICE);
     if (terr == ESP_OK) {
         ESP_LOGI(TAG, "  Sprachausgabe aktiv: %s, Stimme %s.", TTS_MODEL, TTS_VOICE);
     } else if (terr == ESP_ERR_INVALID_ARG) {
-        ESP_LOGW(TAG, "  Sprachausgabe aus — Antwort erscheint nur als Text.");
+        if (!kOhneKi) ESP_LOGW(TAG, "  Sprachausgabe aus — Antwort erscheint nur als Text.");
     } else {
         ESP_LOGE(TAG, "  Sprachausgabe nicht gestartet (%s).",
                  esp_err_to_name(terr));
@@ -1355,12 +1643,26 @@ static bool visualize_mic(void)
     // Das Weckwort braucht seine Tabellen, bevor der erste Block hereinkommt:
     // im Aufnahmetask darf nichts mehr belegt werden.
     const esp_err_t werr = wachwort::bereit();
-    if (werr == ESP_OK) {
+    if (werr == ESP_OK && vergleich::eingelernt() > 0) {
+        ESP_LOGI(TAG, "  Weckwort hoert mit, %d Vorlagen stehen.",
+                 vergleich::eingelernt());
+    } else if (werr == ESP_OK) {
         ESP_LOGI(TAG, "  Weckwort hoert mit. Noch keine Vorlage — BOOT lang "
-                      "halten und das Wort %d mal sagen.",
-                 (int)vergleich::kVorlagen);
+                      "halten und das Wort %d mal sagen, %d nah und %d aus 2 m.",
+                 (int)vergleich::kVorlagen, (int)vergleich::kJeLage,
+                 (int)vergleich::kJeLage);
     } else {
         ESP_LOGW(TAG, "  Weckwort aus (%s).", esp_err_to_name(werr));
+    }
+
+    // Ohne Echounterdrueckung laeuft alles wie frueher weiter, nur dass man
+    // waehrend einer Antwort nicht hineinsprechen kann.
+    if (echo::bereit() == ESP_OK) {
+        ESP_LOGI(TAG, "  Echounterdrueckung aktiv: in eine Antwort hineinsprechen "
+                      "bricht sie ab (Mikrofon waehrenddessen %.1f dB).", kMicDbAntwort);
+    } else {
+        ESP_LOGW(TAG, "  Keine Echounterdrueckung — eine Antwort ist nur mit KEY "
+                      "abzubrechen.");
     }
 
     // Der Aufnahmetakt bekommt einen eigenen Task, auf dem zweiten Kern und
@@ -1382,7 +1684,8 @@ static bool visualize_mic(void)
     // muessen. Kern 1 hat ausser der Anzeige nichts zu tun, und dort steht
     // der Aufnahmetakt ueber ihr: ein ausgelassenes Bild faellt nicht auf,
     // eine verlorene Silbe schon.
-    if (xTaskCreatePinnedToCore(audio_task, "audio", 4096, nullptr, 6, nullptr, 1)
+    // 8 KB Stapel: esp_aec rechnet in diesem Task mit.
+    if (xTaskCreatePinnedToCore(audio_task, "audio", 8192, nullptr, 6, nullptr, 1)
             != pdPASS) {
         ESP_LOGE(TAG, "  Aufnahmetask konnte nicht angelegt werden.");
         return false;
@@ -1396,6 +1699,21 @@ static bool visualize_mic(void)
 static void audio_task(void *)
 {
     static int16_t block[kReadFrames];
+    static int16_t ref_block[kReadFrames];
+
+    // Gereinigter Ton aus der Echounterdrueckung: je Block hoechstens ein
+    // esp_aec-Block hochgetaktet, reichlich bemessen. Der Vorspann gehoert in
+    // den PSRAM, er ist knapp 40 KB gross.
+    static const size_t kSauberFrames   = 2048;
+    static int16_t      sauber[kSauberFrames];
+    const size_t        kVorspannFrames = kSampleRate * echo::kVorspannMs / 1000;
+    int16_t *const      vorspann = (int16_t *)heap_caps_malloc(kVorspannFrames * sizeof(int16_t),
+                                                              MALLOC_CAP_SPIRAM);
+    if (vorspann == nullptr) {
+        nachtrag::schreiben('E', TAG, "Kein Speicher fuer den Vorspann.");
+        vTaskDelete(nullptr);
+    }
+
     int64_t        sum_sq    = 0;
     int32_t        sum_count = 0;
     int32_t        window_pk = 0;
@@ -1407,56 +1725,97 @@ static void audio_task(void *)
         const int64_t t_a = esp_timer_get_time();
 
         // Die KEY-Taste loest nichts mehr aus — das tut das Weckwort. Was ihr
-        // bleibt, ist der Notausgang: waehrend einer Antwort ist das Mikrofon
-        // zu, weil der Lautsprecher denselben I2S-Port belegt, und das Geraet
-        // ist in dieser Zeit taub. Ohne die Taste muesste man eine Antwort,
-        // die in die falsche Richtung laeuft, bis zum Ende anhoeren.
-        //
-        // Sie muss den Port dabei auch wirklich freigeben: wer ihn im selben
-        // Augenblick oeffnet und schliesst, bekommt eine Aufnahme mit null
-        // Frames.
+        // bleibt, ist der Notausgang: eine Antwort abbrechen, auch wenn die
+        // Echounterdrueckung fehlt oder das Hineinsprechen nicht erkennt.
         if (gpio_get_level(KEY_BUTTON_PIN) == 0 && tts.spricht()) {
             tts.abbrechen();
         }
 
-        // Das Mikrofon laeuft jetzt durch und nicht mehr nur waehrend einer
-        // Aufnahme. Das ist eine bewusst umgedrehte Entscheidung: fuer ein
-        // Weckwort muss zugehoert werden, auch wenn niemand drueckt. Zu
-        // bleibt der Wandler nur, solange der Lautsprecher den Port braucht —
-        // beide gleichzeitig zu oeffnen geht nicht, das Oeffnen des einen
-        // richtet beide I2S-Kanaele neu ein.
-        //
-        // Nebenbei faellt damit die Uebergabe beim Tastendruck weg: das
-        // Mikrofon steht schon offen, wenn die Taste heruntergeht.
-        const bool mic_soll = !tts.spricht();
+        // Ohne Antwort hat KEY keine Aufgabe — im Testbetrieb bekommt sie
+        // eine: kurz schaltet die Marke weiter, unter der die naechsten
+        // Woerter gezaehlt werden, lang leert die Statistik. Ausgewertet beim
+        // Loslassen, damit ein langer Druck nicht vorher schon als kurzer
+        // zaehlt.
+        {
+            static int64_t key_seit  = 0;
+            static bool    key_unten = false;
+            static bool    key_lang  = false;
 
-        if (mic_soll && !mic.running()) {
-            const int64_t t0 = esp_timer_get_time();
+            const bool    unten = (gpio_get_level(KEY_BUTTON_PIN) == 0);
+            const int64_t jetzt = esp_timer_get_time();
+
+            if (tts.spricht()) {
+                key_unten = false;   // gehoert dem Abbruch, nicht der Marke
+            } else if (unten && !key_unten) {
+                key_unten = true;
+                key_lang  = false;
+                key_seit  = jetzt;
+            } else if (unten && !key_lang && jetzt - key_seit > 1500000) {
+                key_lang = true;
+                vergleich::statistik_leeren();
+            } else if (!unten && key_unten) {
+                key_unten = false;
+                if (!key_lang && jetzt - key_seit > 30000) {
+                    vergleich::marke_weiter();
+                    nachtrag::schreiben('I', TAG, "Marke: %s.",
+                                        vergleich::marke_name(vergleich::marke()));
+                }
+            }
+        }
+
+        // Das Mikrofon laeuft durch, auch waehrend einer Antwort: der
+        // Lautsprecher belegt den Port nicht mehr, siehe audio.h. Was sich
+        // mit einer Antwort aendert, ist nur, wohin der Ton geht — waehrend
+        // sie laeuft, durch die Echounterdrueckung statt ans Weckwort.
+        static bool nachfrage_offen = false;
+        static bool antwort_lief    = false;
+        static bool    geprueft      = false;   // zum offenen Verdacht lief schon eine Pruefaufnahme
+        static int64_t pruefung_ende = 0;
+        const int64_t  kPruefPauseUs = 1500000;
+
+        if (!mic.running()) {
             mic.start();
             wachwort::ruhe();
-
-            const int ms = (int)((esp_timer_get_time() - t0) / 1000);
-            if (ms > 20) {
-                nachtrag::schreiben('W', TAG, "  Mikrofon auf: %d ms.", ms);
-            }
-        } else if (!mic_soll && mic.running()) {
-            mic.stop();
-
-            // Wellenbild auf die Nulllinie zuruecksetzen. Das stehengelassene
-            // Bild sähe aus wie ein laufendes Signal.
-            xSemaphoreTake(scope_lock, portMAX_DELAY);
-            memset(col_min, 0, sizeof(col_min));
-            memset(col_max, 0, sizeof(col_max));
-            scope_scale = kScaleFloor;
-            shared_rms  = 0;
-            shared_peak = 0;
-            xSemaphoreGive(scope_lock);
-
-            rms       = 0;
-            sum_sq    = 0;
-            sum_count = 0;
-            window_pk = 0;
         }
+
+        const bool antwort = tts.spricht();
+        if (antwort && !antwort_lief) {
+            // Anschlagzaehler seit dem letzten Mal: das ist die Ruhe davor,
+            // und darin muss MIC4 still sein und die Referenz fast auch —
+            // sonst stimmt die Schlitzreihenfolge nicht.
+            nachtrag::schreiben('I', TAG, "Antwort beginnt. Spitzen davor: MIC1 %d, "
+                                          "MIC2 %d, Referenz %d, MIC4 %d.",
+                                (int)mic.spitze(MicInput::kMic1), (int)mic.spitze(MicInput::kMic2),
+                                (int)mic.spitze(MicInput::kRef), (int)mic.spitze(MicInput::kMic4));
+            mic.messung_leeren();
+            if (echo::aktiv()) {
+                mic.verstaerkung(kMicDbAntwort);
+                echo::beginnen(wachwort::ruhepegel(),
+                               powf(10.0f, (kMicDb - kMicDbAntwort) / 20.0f));
+            }
+            nachfrage_offen = false;
+            geprueft        = false;
+        } else if (!antwort && antwort_lief) {
+            mic.verstaerkung(kMicDb);
+            echo::beenden();
+            nachtrag::schreiben('I', TAG, "Spitzen waehrend der Antwort: MIC1 %d (%d am "
+                                          "Anschlag), MIC2 %d (%d), Referenz %d (%d), MIC4 %d.",
+                                (int)mic.spitze(MicInput::kMic1), (int)mic.anschlag(MicInput::kMic1),
+                                (int)mic.spitze(MicInput::kMic2), (int)mic.anschlag(MicInput::kMic2),
+                                (int)mic.spitze(MicInput::kRef), (int)mic.anschlag(MicInput::kRef),
+                                (int)mic.spitze(MicInput::kMic4));
+            mic.messung_leeren();
+
+            // Das Weckwort hat waehrend der Antwort nichts bekommen und
+            // faengt neu an; seine Einschwingzeit deckt auch das Umschalten
+            // der Verstaerkung und den Nachhall ab. Wurde nicht
+            // hineingesprochen, wird danach ohne Weckwort weiter zugehoert,
+            // siehe unten.
+            wachwort::ruhe();
+            nachfrage_offen = !listener.listening();
+        }
+        antwort_lief = antwort;
+        tts.leiser(antwort && listener.listening() && listener.pruefung());
 
         // Faengt eine Aufnahme an, waehrend der Lautsprecher gerade noch lief,
         // klingt er ins Mikrofon nach. Sonst ist der Wandler vom ersten Block
@@ -1469,8 +1828,11 @@ static void audio_task(void *)
             static int64_t stimme_bis   = 0;
             if (tts.spricht()) stimme_bis = esp_timer_get_time();
 
+            // Die Nachfrage beginnt erst nach dem Einschwinger, siehe unten.
+            // Da ist nichts mehr abzuschneiden, und jeder Schnitt fehlte am
+            // ersten Wort.
             const bool hoert = listener.listening();
-            if (hoert && !hoerte
+            if (hoert && !hoerte && !listener.nachfrage()
                 && esp_timer_get_time() - stimme_bis < 500000) {
                 listener.nachklang_erwarten();
             }
@@ -1483,25 +1845,75 @@ static void audio_task(void *)
         if (!mic.running()) {
             vTaskDelay(pdMS_TO_TICKS(20));
             t_c = esp_timer_get_time();
-        } else if (mic.read_mono(block, kReadFrames) != ESP_OK) {
+        } else if (mic.read(block, ref_block, kReadFrames) != ESP_OK) {
             nachtrag::schreiben('W', TAG, "  Lesefehler, naechster Versuch.");
             vTaskDelay(pdMS_TO_TICKS(20));
             t_c = esp_timer_get_time();
         } else {
             t_c = esp_timer_get_time();
-            listener.feed(block, kReadFrames);
 
-            // Waehrend einer Aufnahme hoert das Weckwort nicht mit: wer schon
-            // spricht, muss nicht geweckt werden — und "HoiHoi" mitten in der
-            // Frage soll die laufende Aufnahme nicht von vorn beginnen.
-            //
-            // Der Ruhepegel, den es dabei nachfuehrt, gilt weiter: er stammt
-            // aus der Zeit unmittelbar vor dem Weckwort, und das ist die
-            // letzte, in der im Raum nachweislich niemand gesprochen hat.
-            if (!listener.listening()) {
-                wachwort::feed(block, kReadFrames, kSampleRate);
-                if (wachwort::geweckt()) {
-                    listener.wecken(wachwort::ruhepegel());
+            if (antwort) {
+                // Waehrend einer Antwort. Die Aufnahme bekommt den gereinigten
+                // Ton — sie laeuft hier nur, wenn in die Antwort
+                // hineingesprochen wurde, und dann klingt der Lautsprecher
+                // noch einen Moment nach.
+                const size_t m = echo::verarbeiten(block, ref_block, kReadFrames,
+                                                   sauber, kSauberFrames);
+                if (listener.listening()) {
+                    listener.feed(sauber, m);
+                    pruefung_ende = esp_timer_get_time();
+                } else if (echo::unterbrochen() && geprueft) {
+                    // Die Pruefaufnahme ist vorbei, und die Antwort laeuft
+                    // noch. Ihr Text braucht nach dem Ende einen Moment bis
+                    // zur Entscheidung (hineingesprochen()); erst danach darf
+                    // ein neuer Verdacht eine neue Aufnahme starten.
+                    if (esp_timer_get_time() - pruefung_ende > kPruefPauseUs) {
+                        echo::weiter();
+                        geprueft = false;
+                    }
+                } else if (echo::unterbrochen()) {
+                    // Aufnehmen wie nach einer Antwort, aber als
+                    // Pruefaufnahme: die Antwort laeuft leiser weiter, bis
+                    // die Erkennung Worte gefunden hat. Siehe echo.h.
+                    listener.pruefen(wachwort::ruhepegel());
+                    geprueft      = true;
+                    pruefung_ende = esp_timer_get_time();
+
+                    // Den Anfang des Satzes nachreichen, in Aufnahmebloecken,
+                    // damit Stilleuhr und Lautzaehler dieselben Stuecke sehen
+                    // wie sonst.
+                    const size_t v = echo::vorspann(vorspann, kVorspannFrames);
+                    for (size_t i = 0; i < v && listener.listening(); i += kReadFrames) {
+                        const size_t k = (v - i < (size_t)kReadFrames) ? v - i
+                                                                       : (size_t)kReadFrames;
+                        listener.feed(vorspann + i, k);
+                    }
+                }
+            } else {
+                listener.feed(block, kReadFrames);
+
+                // Waehrend einer Aufnahme hoert das Weckwort nicht mit: wer
+                // schon spricht, muss nicht geweckt werden — und "HoiHoi"
+                // mitten in der Frage soll die laufende Aufnahme nicht von
+                // vorn beginnen.
+                //
+                // Der Ruhepegel, den es dabei nachfuehrt, gilt weiter: er
+                // stammt aus der Zeit unmittelbar vor dem Weckwort, und das
+                // ist die letzte, in der im Raum nachweislich niemand
+                // gesprochen hat.
+                if (!listener.listening()) {
+                    wachwort::feed(block, kReadFrames, kSampleRate);
+                    if (wachwort::geweckt()) {
+                        nachfrage_offen = false;
+                        listener.wecken(wachwort::ruhepegel());
+                    } else if (nachfrage_offen && wachwort::eingeschwungen()) {
+                        // Die Antwort ist vorbei und der Wandler wieder
+                        // ruhig: zuhoeren, als waere das Weckwort gefallen.
+                        // Kommt in kNachfrageMs kein Wort, geht es zurueck
+                        // zum Weckwort.
+                        nachfrage_offen = false;
+                        listener.nachfragen(wachwort::ruhepegel());
+                    }
                 }
             }
 

@@ -77,6 +77,13 @@ class Stt {
     // tatsaechlich eine neue Aeusserung fertig ist.
     void copy_final(char *out, size_t n) const;
 
+    // Entscheidet ueber den Endtext einer Pruefaufnahme (Listener::pruefung):
+    // true heisst, es wurde wirklich etwas gesagt, und der Text geht als
+    // Frage weiter. false verwirft ihn — dann bekommt der Chat einen leeren
+    // Endtext und fragt nichts. Laeuft im WebSocket-Task.
+    using Pruefer = bool (*)(const char *text);
+    void pruefer(Pruefer f) { pruefer_ = f; }
+
   private:
     static void task_trampolin(void *self);
     static void ws_event(void *handler_args, esp_event_base_t base,
@@ -114,11 +121,17 @@ class Stt {
 
     size_t gesendet_ = 0;      // Frames, die schon draussen sind
 
+    Pruefer          pruefer_  = nullptr;
+    volatile int32_t pruefung_ = 0;   // die laufende Aeusserung ist eine Pruefaufnahme
+
     char              text_[kMaxText] = {0};
     size_t            text_len_       = 0;
     char              final_[kMaxText] = {0};
     volatile int32_t  final_seq_       = 0;
     SemaphoreHandle_t text_lock_      = nullptr;
+
+    // Senden gegen Abbau, siehe send_json().
+    SemaphoreHandle_t senden_lock_    = nullptr;
 
     // Arbeitspuffer fuer eine Sendung: Rohton, Base64 und die JSON-Huelle.
     // Einmal angelegt statt je Block auf dem Stack — 100 ms bei 24 kHz sind

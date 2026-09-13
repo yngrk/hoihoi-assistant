@@ -7,9 +7,11 @@
 
 namespace {
 
-// Vier Zeilen reichen: der Aufnahmetask meldet einmal pro Sekunde, der Leser
-// schaut zehnmal so oft nach.
-const int kZeilen = 4;
+// Vier Zeilen reichten, solange der Aufnahmetask einmal pro Sekunde meldete.
+// Seit dem Weckwort faellt es gebuendelt an: Wort, Abstand und "Zuhoeren
+// gestartet" liegen innerhalb von drei Millisekunden, und der Leser schaut nur
+// alle 100 ms nach. Sechzehn Zeilen sind knapp 4 KB.
+const int kZeilen = 16;
 const int kBreite = 240;
 
 char             s_text[kZeilen][kBreite];

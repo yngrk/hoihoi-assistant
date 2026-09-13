@@ -943,13 +943,62 @@ dort Gerätename und Nachweis stehen.
 - **Batterie-ADC**: Das Teilerverhältnis am ADC ist nicht dokumentiert, deshalb
   wird bisher nur der Rohwert geloggt. Für eine Spannungsangabe muss der Faktor
   am Schaltplan oder empirisch bestimmt werden.
-- **Vorlagen im NVS**: das Einlernen liegt nur im RAM. Nach jedem Einschalten
-  ist das Gerät wieder leer und will neu eingelernt werden.
-- **Fehlauslösungen über eine Stunde**: bisher nur über eine halbe Minute
-  gemessen, und daraus lässt sich keine Rate je Stunde ableiten.
-- **Taub während der Antwort**: Mikrofon und Lautsprecher teilen sich den
-  I²S-Port, also hört das Weckwort nicht mit, solange gesprochen wird. Der
-  Notausgang bleibt die KEY-Taste.
+- **Fehlauslösungen**: „ha ha", „he he" und „ho ho" sind mit der Art „Fest"
+  (Schwelle 12,75) weitgehend erledigt. Offen sind die Reimwörter: „noi noi",
+  „toi toi", „loi loi" und „oi oi" wecken das Gerät ebenfalls. Das ist die
+  Grenze des Verfahrens, nicht der Schwelle — MFCC und DTW lernen nie, was
+  *nicht* das Weckwort ist, und der Unterschied steckt im Anlaut, ein bis drei
+  von rund fünfzig Rahmen, und das /h/ ist kaum mehr als leises Rauschen.
+- **Weckwort als trainiertes Modell (geplant)**: microWakeWord (Apache-2.0,
+  aus ESPHome/Home Assistant) ersetzt den Vorlagenvergleich. Das Modell ist
+  ein kleines, zustandsbehaftetes int8-Netz für esp-tflite-micro, unter 10 ms
+  je Durchlauf auf dem S3, und es wird ausdrücklich gegen Beinahe-Treffer
+  trainiert. Trainiert wird auf einem Mac (Apple Silicon) mit
+  [microWakeWord-Trainer-AppleSilicon](https://github.com/TaterTotterson/microWakeWord-Trainer-AppleSilicon):
+
+  | | |
+  |---|---|
+  | Weckwort | „Hoi Hoi", Deutsch |
+  | Negative | noi noi, toi toi, loi loi, oi oi, boi boi, moi moi, koi koi, ahoi, hui hui, hey hey, Heute, Hoheit, „Hoi" einzeln |
+  | Format | streaming microWakeWord v2, int8, 40 Merkmalskanäle, feature_step_size 10 ms — kompatibel mit ESPHomes `micro_wake_word` |
+  | Ergebnis | `<wort>.tflite` und `<wort>.json` |
+  | Später | eigene Aufnahmen über die Mikrofone des Boards als persönliche und negative Beispiele, dann ein zweites Training |
+
+  Auf dem Gerät kommen dazu esp-tflite-micro, esp-nn und
+  esp-micro-speech-features, eine Umtaktung von 24 auf 16 kHz und die
+  Fensterlogik aus ESPHomes `streaming_model.cpp`. Die Firmware ist davon
+  noch unberührt.
+- **Stimme ohne OpenAI**: gesprochen wird die Antwort bisher bei OpenAI. Das
+  kostet je Satz, und von den 3,4 bis 4,9 Sekunden bis zum ersten Ton hängt ein
+  guter Teil am Netz. Piper soll die Rolle übernehmen — nicht auf dem S3, dafür
+  ist es ein VITS-Modell, sondern auf einem vorhandenen dedizierten Server.
+  Rechenzeit ist dort keine Frage mehr; die Arbeit liegt im Wrapper davor.
+
+  Das Gerät bekommt dabei keine neue Schnittstelle, sondern dieselbe: der
+  Wrapper bildet die Form von `POST /v1/audio/speech` nach und liefert rohes
+  s16le, 24 kHz, mono, ohne Kopf, im Strom. Dann ändern sich in `tts.cpp` nur
+  `kUrl`, die Vorwärm-Adresse und der Schlüssel; Ring, Vorlauf und
+  Stockungszähler bleiben unberührt. Das Zertifikat macht keine Arbeit, weil
+  `esp_crt_bundle_attach` die üblichen Wurzeln schon mitbringt.
+
+  Drei Dinge muss der Wrapper leisten, und alle drei sind leicht zu übersehen:
+
+  | | |
+  |---|---|
+  | Abtastrate | Piper-Stimmen laufen auf 22050 Hz (medium/high) oder 16000 (low), das Gerät auf 24000. Umgerechnet wird auf dem Server, nicht auf dem S3. |
+  | Stehender Dienst | Ein medium-Modell sind 60 bis 75 MB. Wer `piper` je Anfrage startet, zahlt das Laden jedes Mal — und das kostet mehr als die Synthese. |
+  | Strom statt Sammeln | `--output-raw` gibt den Ton aus, während er entsteht. Ungepuffert durchreichen, sonst ist der Gewinn wieder weg. |
+
+  Ein Bearer-Token prüft der Wrapper ebenfalls: ein offener Sprachdienst im Netz
+  ist eine Rechnung, die jemand anders schreibt.
+- **Hineinsprechen in die Antwort**: der I²S-Port läuft jetzt im Vollduplex
+  (RX als TDM mit vier Schlitzen, Schlitz 1 ist die Rückführung des
+  Lautsprechers), und esp_aec aus esp-sr zieht das Echo ab, siehe `echo.h`.
+  Ein Pegelverdacht startet eine Pruefaufnahme; die Antwort läuft leiser
+  weiter und bricht erst ab, wenn die Erkennung Worte findet, die nicht aus der
+  Antwort selbst stammen (`hineingesprochen()` in `main.cpp`). Noch nicht über
+  längere Zeit getestet. Die Abschnitte oben zu Port-Übergabe und
+  Mikrofon-Zeiten beschreiben teils noch den Stand davor.
 - **Stockende Anzeige beim ersten Handschlag**: laufen Erkennung, Chat und
   Stimme gleichzeitig durch ihren TLS-Aufbau, fällt die Bildrate für rund eine
   Sekunde auf 15/s, einzelne Bilder brauchen über eine Sekunde. Die Aufnahme

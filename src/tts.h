@@ -92,6 +92,11 @@ class Tts {
     // wartet darauf, bevor er das Mikrofon oeffnet.
     bool spricht() const { return auftrag_ != 0; }
 
+    // Leiser, solange eine Pruefaufnahme laeuft: wer hineinspricht, hoert
+    // sofort, dass er gehoert wird, und das Echo wird kleiner — abgebrochen
+    // wird erst, wenn die Erkennung Worte gefunden hat.
+    void leiser(bool an) { leiser_ = an ? 1 : 0; }
+
   private:
     static void hol_trampolin(void *self);
     static void spiel_trampolin(void *self);
@@ -137,9 +142,10 @@ class Tts {
 
     // Vorlauf, und damit die Stockung, die folgenlos bleibt. Zwei Sekunden
     // waren die sichere Wahl, als der Knacks gerade weg war; sie standen
-    // aber auch mit zwei Sekunden auf dem Weg zum ersten Ton. Jetzt 1,2 —
-    // und der Spieler zaehlt mit, ob es reicht.
-    static const uint32_t kVorlaufFrames = kRate * 6 / 5;
+    // aber auch mit zwei Sekunden auf dem Weg zum ersten Ton. Dann 1,2, und
+    // bei vier Antworten mit 1,2 s blieb der Zaehler jedes Mal auf null.
+    // Jetzt 0,6 — steigen die Stockungen, war das zu viel.
+    static const uint32_t kVorlaufFrames = kRate * 3 / 5;
 
     int16_t *ring_ = nullptr;
 
@@ -154,6 +160,7 @@ class Tts {
     volatile int32_t fertig_     = 0;   // nichts kommt mehr nach
     volatile int32_t abbruch_    = 0;   // Taste gedrueckt, Rest verwerfen
     volatile int32_t stockungen_ = 0;   // Ring lief mitten im Sprechen leer
+    volatile int32_t leiser_     = 0;
 
     // 2048 Byte sind 1024 Frames und damit genau ein write_mono().
     static const size_t kLeseBytes = 2048;

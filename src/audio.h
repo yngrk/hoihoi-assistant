@@ -3,9 +3,9 @@
 // ---------------------------------------------------------------------------
 // Mikrofoneingang ueber den ES7210 (I2C 0x40) und I2S.
 //
-// Der ES7210 ist ein reiner ADC: er digitalisiert die beiden Onboard-Mikrofone
-// und schiebt sie als I2S-Stream heraus. Takt und Wortsynchronisation kommen
-// vom ESP32-S3 (I2S-Master), der ES7210 laeuft als Slave — deshalb muss MCLK
+// Der ES7210 ist ein reiner ADC: er digitalisiert die Onboard-Mikrofone und
+// schiebt sie als I2S-Stream heraus. Takt und Wortsynchronisation kommen vom
+// ESP32-S3 (I2S-Master), der ES7210 laeuft als Slave — deshalb muss MCLK
 // bespielt werden, sonst laeuft der Wandler ohne Referenz.
 //
 // Die Registerprogrammierung uebernimmt Espressifs Komponente esp_codec_dev.
@@ -18,6 +18,24 @@
 // Controller koennten dieselben Pins nicht gemeinsam treiben. Der Port wird
 // deshalb einmal angelegt und von beiden Klassen benutzt; wer zuerst begin()
 // ruft, legt die Abtastrate fest.
+//
+// ---------------------------------------------------------------------------
+// Vier Kanaele statt zwei: die Referenz fuer die Echounterdrueckung
+//
+// Die Platine fuehrt den Ausgang des ES8311 auf den dritten Eingang des
+// ES7210 zurueck. Das ist genau das Signal, das der Lautsprecher bekommt, im
+// selben Abtasttakt wie die Mikrofone — die Referenz, die eine
+// Echounterdrueckung braucht, und ohne jede Verzoegerung zwischen beiden.
+// Mit mehr als zwei Eingaengen spricht der ES7210 TDM, vier Schlitze je
+// Abtastwert, und zwar in der Reihenfolge MIC1, MIC3, MIC2, MIC4. Die
+// Verstaerkungsregister zaehlen dagegen nach der Bestueckung: MIC3 ist dort
+// Kanal 2 und nicht 1. Beides steht so auch in xiaozhi-esp32, das auf dieser
+// Platine laeuft.
+//
+// Das Mikrofon bleibt damit dauerhaft offen, auch waehrend einer Antwort.
+// Frueher war es dann zu, weil jedes Oeffnen des Lautsprechers beide Kanaele
+// neu einrichtete; jetzt bleibt auch der Lautsprecher offen und nur sein
+// Verstaerker wird geschaltet.
 // ---------------------------------------------------------------------------
 
 #include <stddef.h>
@@ -31,9 +49,12 @@
 
 class MicInput {
   public:
-    // Groesster Block, den read_mono() auf einmal liefern kann. Begrenzt den
+    // Groesster Block, den read() auf einmal liefern kann. Begrenzt den
     // intern gehaltenen Zwischenpuffer fuer die verschraenkten Rohdaten.
     static const size_t kMaxFrames = 1024;
+
+    // Schlitze im TDM-Rahmen, siehe oben.
+    enum Schlitz { kMic1 = 0, kRef = 1, kMic2 = 2, kMic4 = 3, kSchlitze = 4 };
 
     // bus muss ein bereits angelegter I2C-Master-Bus sein — der ES7210 haengt
     // am selben Bus wie die uebrigen Bausteine, ein zweiter waere ein Konflikt.
@@ -44,44 +65,49 @@ class MicInput {
     // in Dreierschritten, danach 34.5, 36 und 37.5 dB — mehr gibt der Baustein
     // nicht her. Der Standardwert der Komponente waeren 30 dB; das war hier
     // hoerbar zu leise, Sprache landete bei etwa -19 dBFS effektiv.
+    //
+    // ref_db ist die Verstaerkung des Referenzeingangs. Uebersteuert er, ist
+    // die Referenz nicht mehr das, was der Lautsprecher spielt, und die
+    // Echounterdrueckung rechnet mit dem falschen Signal.
     esp_err_t begin(i2c_master_bus_handle_t bus,
                     uint32_t sample_rate = 24000,
-                    float    gain_db     = 37.5f);
+                    float    gain_db     = 37.5f,
+                    float    ref_db      = 15.0f);
 
-    // Mikrofon an und aus. Nur zwischen start() und stop() digitalisiert der
-    // ES7210 ueberhaupt etwas; ausserhalb ist er zugeklappt. Ein Geraet mit
-    // Mikrofon soll nicht dauerhaft zuhoeren, und ob es das tut, darf man
-    // nicht glauben muessen — es ist derselbe Baustein, der sonst laeuft.
     esp_err_t start();
     void      stop();
     bool      running() const { return running_; }
 
-    // Liest frames Frames und mittelt die beiden Kanaele zu einem Monosignal.
-    // Blockiert, bis so viele Frames vorliegen — bei 24 kHz sind 480 Frames
-    // also 20 ms.
-    esp_err_t read_mono(int16_t *out, size_t frames);
+    // Liest frames Frames. mono ist der Mittelwert der beiden Mikrofone, ref
+    // die Referenz vom Lautsprecher (darf nullptr sein). Blockiert, bis so
+    // viele Frames vorliegen — bei 24 kHz sind 480 Frames also 20 ms.
+    esp_err_t read(int16_t *mono, int16_t *ref, size_t frames);
+
+    // Verstaerkung der beiden Mikrofone, ohne die Referenz. Waehrend einer
+    // Antwort wird sie gesenkt: ein uebersteuertes Echo ist nicht mehr linear
+    // und laesst sich nicht mehr abziehen.
+    esp_err_t verstaerkung(float gain_db);
+    float     verstaerkung() const { return gain_db_; }
 
     uint32_t sample_rate() const { return sample_rate_; }
-    uint8_t  channels() const { return kChannels; }
 
-    // Spitzenwerte der beiden Wandlerkanaele seit start(), unvermischt. Wenn
-    // nur ein Mikrofon bestueckt ist, steht der zweite Kanal auf Null — und
-    // die Mittelung in read_mono() kostet dann genau 6 dB, ohne dass man es
-    // dem Mischsignal ansieht.
-    int32_t peak_left() const { return peak_l_; }
-    int32_t peak_right() const { return peak_r_; }
+    // Spitzenwerte und Zahl der Werte am Anschlag je Schlitz, seit dem
+    // letzten Aufruf von messung_leeren(). Aus ihnen ist abzulesen, ob die
+    // Schlitzreihenfolge stimmt (MIC4 ist nicht bestueckt und bleibt still)
+    // und ob Mikrofon oder Referenz uebersteuern.
+    int32_t spitze(int schlitz) const { return peak_[schlitz]; }
+    int32_t anschlag(int schlitz) const { return clip_[schlitz]; }
+    void    messung_leeren();
 
   private:
-    static const uint8_t kChannels = 2;
-
-    i2s_chan_handle_t      rx_    = nullptr;
     esp_codec_dev_handle_t codec_ = nullptr;
     uint32_t               sample_rate_ = 0;
     float                  gain_db_ = 0.0f;
+    float                  ref_db_  = 0.0f;
     bool                   running_ = false;
-    int32_t                peak_l_  = 0;
-    int32_t                peak_r_  = 0;
-    int16_t               *scratch_ = nullptr;   // kMaxFrames * kChannels
+    int32_t                peak_[kSchlitze] = {0};
+    int32_t                clip_[kSchlitze] = {0};
+    int16_t               *scratch_ = nullptr;   // kMaxFrames * kSchlitze
 };
 
 class SpeakerOutput {
@@ -96,6 +122,8 @@ class SpeakerOutput {
     // -50 bis 0 dB ab. 70 waeren also nicht "etwas leiser", sondern -15 dB,
     // und genau so klingt es auch. 100 ist deshalb der Normalfall und nicht
     // die Ausnahme — lauter geht ueber den DAC ohnehin nicht ohne Clipping.
+    //
+    // Der Wandler wird hier schon geoeffnet und bleibt offen, siehe oben.
     esp_err_t begin(i2c_master_bus_handle_t bus,
                     uint32_t sample_rate = 24000,
                     int      volume      = 100);
@@ -106,9 +134,8 @@ class SpeakerOutput {
     // zu tief.
     esp_err_t write_mono(const int16_t *pcm, size_t frames);
 
-    // Wiedergabe an und aus. start() schaltet dabei ueber den PA-Pin auch den
-    // Verstaerker ein, stop() wieder aus — ein eingeschalteter Verstaerker
-    // ohne Signal rauscht hoerbar.
+    // Verstaerker an und aus. Ein eingeschalteter Verstaerker ohne Signal
+    // rauscht hoerbar, deshalb bleibt er nur waehrend einer Antwort an.
     esp_err_t start();
     void      stop();
     bool      running() const { return running_; }
@@ -118,7 +145,6 @@ class SpeakerOutput {
   private:
     static const uint8_t kChannels = 2;
 
-    i2s_chan_handle_t      tx_    = nullptr;
     esp_codec_dev_handle_t codec_ = nullptr;
     uint32_t               sample_rate_ = 0;
     int                    volume_  = 100;

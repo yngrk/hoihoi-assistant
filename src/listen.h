@@ -79,10 +79,27 @@ class Listener {
     // abwarten muessen.
     static const int32_t kWartenMs = 3000;
 
+    // Nach einer Antwort wird ohne Weckwort weiter zugehoert, so lange. Wer
+    // nachfragen will, soll nicht jedes Mal "HoiHoi" voranstellen muessen —
+    // und wer nichts mehr will, soll nicht lange auf das Ende warten. Die
+    // Frist ist laenger als nach dem Weckwort: dort hat man gerade selbst
+    // angefangen, hier muss man die Antwort erst verdauen.
+    static const int32_t kNachfrageMs = 5000;
+
     // Und so lange Stille beendet den Satz. Eine Denkpause mitten in einem
     // Satz ist selten laenger; eine Pause zwischen zwei Saetzen ist es fast
     // immer. Wo die Grenze wirklich liegt, sagt erst der Gebrauch.
     static const int32_t kStilleMs = 900;
+    //
+    // Gemessen, laengste Pause innerhalb einer Frage: 460, 260, 140, 140, 320,
+    // 0, 40 — und 820 ms in "Okay, ... cool." Die 900 bleiben also.
+
+    // So viel lauter Ton muss eine Aufnahme mindestens enthalten, sonst wird
+    // sie verworfen wie eine, in der nichts gesagt wurde. Ein Stuhlruecken in
+    // der Nachfrage ergab 4,3 s mit Effektivwert 59 und genug einzelnen
+    // lauten Bloecken, um als Satz zu gelten — echte Fragen lagen bei 220 bis
+    // 530. Ein einsilbiges "Ja" hat gut 200 ms.
+    static const int32_t kMinLautMs = 200;
 
     // Dieselbe Regel wie bei der Wortabgrenzung des Weckworts: das Vierfache
     // der Ruhe, aber nie unter einem festen Boden.
@@ -98,6 +115,16 @@ class Listener {
     // Ein zweiter Aufruf waehrend einer laufenden Aufnahme tut nichts.
     void wecken(int32_t ruhe);
 
+    // Dasselbe ohne Weckwort, direkt nach einer Antwort: laenger Zeit fuer das
+    // erste Wort (kNachfrageMs), sonst gleich.
+    void nachfragen(int32_t ruhe);
+    bool nachfrage() const { return nachfrage_ != 0; }
+
+    // Dasselbe waehrend einer Antwort, als Pruefaufnahme: die Antwort laeuft
+    // weiter, bis die Erkennung darin Worte findet. Siehe echo.h.
+    void pruefen(int32_t ruhe);
+    bool pruefung() const { return pruefung_ != 0; }
+
     // PCM aus dem Aufnahmetask. Schreibt nur mit, solange zugehoert wird.
     void feed(const int16_t *pcm, size_t frames);
 
@@ -111,7 +138,11 @@ class Listener {
     // Dauer der laufenden Aufnahme; 0, wenn gerade nicht zugehoert wird.
     int32_t elapsed_ms() const;
 
-    // Dauer und Spitzenpegel der zuletzt abgeschlossenen Aufnahme.
+    // Dauer und Spitzenpegel der zuletzt abgeschlossenen Aufnahme. Wurde
+    // darin nichts gesagt, hat sie null Frames: drei Sekunden Raumrauschen
+    // gehoeren nicht in die Erkennung. Die antwortet darauf gern mit einem
+    // erfundenen Satz — und nach jeder Antwort ohne Nachfrage kaeme so eine
+    // neue Frage zustande.
     int32_t last_ms() const { return last_ms_; }
     int32_t last_peak() const { return last_peak_; }
     int32_t last_rms() const { return last_rms_; }
@@ -126,7 +157,7 @@ class Listener {
     size_t live_count() const { return (size_t)live_frames_; }
 
   private:
-    void start();
+    void start(int32_t warten_ms);
     void stop(const char *grund);
 
     // Entscheidet je Block, ob der Satz zu Ende ist. Bekommt den Ton so, wie
@@ -173,4 +204,13 @@ class Listener {
     int32_t schwelle_ = 0;       // ab hier gilt ein Block als Sprache
     bool    sprach_   = false;   // seit dem Weckwort ist etwas gesagt worden
     int32_t still_ms_ = 0;       // Stille am Stueck
+    int32_t warten_ms_ = kWartenMs;   // Frist fuer das erste Wort
+    int32_t laut_ms_   = 0;           // Summe der Bloecke ueber der Schwelle
+    volatile int32_t nachfrage_ = 0;
+    volatile int32_t pruefung_  = 0;
+
+    // Die laengste Pause mitten im Satz, also eine, nach der noch gesprochen
+    // wurde. Aus ihr ergibt sich, wie weit kStilleMs herunter darf: sie ist
+    // der Abstand, den eine Aufnahme nie unterschreiten sollte.
+    int32_t pause_max_ms_ = 0;
 };

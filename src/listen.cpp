@@ -43,7 +43,7 @@ int32_t Listener::elapsed_ms() const
     return now_ms() - started_ms_;
 }
 
-void Listener::start()
+void Listener::start(int32_t warten_ms)
 {
     fill_         = 0;
     live_frames_  = 0;
@@ -55,13 +55,17 @@ void Listener::start()
     last_frames_ = 0;
     sprach_      = false;
     still_ms_    = 0;
+    pause_max_ms_ = 0;
+    warten_ms_   = warten_ms;
+    laut_ms_     = 0;
     listening_   = 1;
 
     // Nicht ESP_LOGI: dieser Aufruf kommt aus dem Aufnahmetask, und zwar in
     // dem Augenblick, in dem das Weckwort erkannt ist. Eine blockierende
     // Ausgabe hier schoebe alles Weitere um Zehntelsekunden nach hinten —
     // genau das erste Wort.
-    nachtrag::schreiben('I', TAG, "Zuhoeren gestartet (Schwelle %d).",
+    nachtrag::schreiben('I', TAG, "Zuhoeren gestartet (%s, Schwelle %d).",
+                        pruefung_ ? "Pruefaufnahme" : nachfrage_ ? "Nachfrage" : "Weckwort",
                         (int)schwelle_);
 }
 
@@ -70,8 +74,32 @@ void Listener::wecken(int32_t ruhe)
     if (listening_ != 0) return;
 
     if (ruhe < 1) ruhe = 1;
-    schwelle_ = ruhe * kFaktor + kBoden;
-    start();
+    schwelle_  = ruhe * kFaktor + kBoden;
+    nachfrage_ = 0;
+    pruefung_  = 0;
+    start(kWartenMs);
+}
+
+void Listener::nachfragen(int32_t ruhe)
+{
+    if (listening_ != 0) return;
+
+    if (ruhe < 1) ruhe = 1;
+    schwelle_  = ruhe * kFaktor + kBoden;
+    nachfrage_ = 1;
+    pruefung_  = 0;
+    start(kNachfrageMs);
+}
+
+void Listener::pruefen(int32_t ruhe)
+{
+    if (listening_ != 0) return;
+
+    if (ruhe < 1) ruhe = 1;
+    schwelle_  = ruhe * kFaktor + kBoden;
+    nachfrage_ = 1;
+    pruefung_  = 1;
+    start(kNachfrageMs);
 }
 
 void Listener::nachklang_erwarten()
@@ -90,7 +118,8 @@ void Listener::stop(const char *grund)
     last_ms_ = now_ms() - started_ms_;
 
     measure();
-    last_frames_ = (int32_t)fill_;
+    const bool genug = sprach_ && laut_ms_ >= kMinLautMs;
+    last_frames_ = genug ? (int32_t)fill_ : 0;
     listening_   = 0;
 
     // Der Puffer bleibt stehen — hier setzt spaeter die Worterkennung an.
@@ -101,10 +130,16 @@ void Listener::stop(const char *grund)
     // Die Fundstelle der Spitze dazu: liegt sie gleich am Anfang, ist sie kein
     // Sprachsignal, sondern der Rest des Einschwingers — und dann taugt sie
     // nicht als Bezug fuer irgendeine Verstaerkung.
-    ESP_LOGI(TAG, "Zuhoeren beendet (%s): %d ms, %u Frames, "
-                  "Spitze %d, Effektivwert %d, Grundrauschen %d.",
-             grund, (int)last_ms_, (unsigned)fill_, (int)last_peak_,
-             (int)last_rms_, (int)last_noise_);
+    //
+    // Ueber nachtrag und nicht ESP_LOGI: stop() kommt aus feed(), also aus
+    // dem Aufnahmetask, und direkt dahinter hoert das Weckwort wieder zu.
+    nachtrag::schreiben('I', TAG, "Zuhoeren beendet (%s): %d ms, %u Frames, "
+                                  "Spitze %d, Effektivwert %d, Grundrauschen %d, "
+                                  "laengste Pause %d ms, laut %d ms.%s",
+                        grund, (int)last_ms_, (unsigned)fill_, (int)last_peak_,
+                        (int)last_rms_, (int)last_noise_, (int)pause_max_ms_,
+                        (int)laut_ms_,
+                        (sprach_ && !genug) ? "  Zu wenig Sprache, verworfen." : "");
 }
 
 // Ein Durchgang ueber den fertigen Mitschnitt. Spitze und Effektivwert sagen
@@ -158,6 +193,8 @@ void Listener::ende_pruefen(const int16_t *pcm, size_t frames)
     const int32_t ms  = (int32_t)(frames * 1000 / rate_);
 
     if (rms > schwelle_) {
+        laut_ms_ += ms;
+        if (sprach_ && still_ms_ > pause_max_ms_) pause_max_ms_ = still_ms_;
         sprach_   = true;
         still_ms_ = 0;
         return;
@@ -168,7 +205,7 @@ void Listener::ende_pruefen(const int16_t *pcm, size_t frames)
     // Vor dem ersten Wort gilt die laengere Frist: es darf jemand ueberlegen.
     // Danach beendet die Pause die Aufnahme.
     if (!sprach_) {
-        if (still_ms_ >= kWartenMs) stop("nichts gesagt");
+        if (still_ms_ >= warten_ms_) stop("nichts gesagt");
         return;
     }
 

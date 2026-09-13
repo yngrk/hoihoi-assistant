@@ -167,7 +167,16 @@ void Tts::spielen()
                              : SpeakerOutput::kMaxFrames;
             if (n > bis_ende) n = bis_ende;
 
-            if (aus_->write_mono(ring_ + off, n) != ESP_OK) {
+            // Um 12 dB leiser, siehe leiser(). Die Referenz der
+            // Echounterdrueckung folgt von selbst, sie ist der Ausgang.
+            const int16_t *ton = ring_ + off;
+            static int16_t gedaempft[SpeakerOutput::kMaxFrames];
+            if (leiser_) {
+                for (uint32_t i = 0; i < n; i++) gedaempft[i] = (int16_t)(ton[i] / 4);
+                ton = gedaempft;
+            }
+
+            if (aus_->write_mono(ton, n) != ESP_OK) {
                 ESP_LOGW(TAG, "Ausgabe abgebrochen (Schreibfehler).");
                 break;
             }
@@ -175,7 +184,8 @@ void Tts::spielen()
             spoken_ms_ += (int32_t)((int64_t)n * 1000 / kRate);
 
             // Wer die Taste drueckt, will sprechen und nicht zuhoeren.
-            if (taste_ != nullptr && taste_->listening()) {
+            // Eine Pruefaufnahme bricht nicht ab, siehe leiser().
+            if (taste_ != nullptr && taste_->listening() && !taste_->pruefung()) {
                 ESP_LOGI(TAG, "Ausgabe abgebrochen (Taste gedrueckt).");
                 abbruch_ = 1;
                 break;
@@ -238,7 +248,14 @@ size_t Tts::stueck_holen(const char *text)
         if (vorn) lese_[0] = rest_;
 
         const int r = weg_.lesen((char *)lese_ + vorn, (int)(kLeseBytes - vorn));
-        if (r <= 0) break;
+        if (r < 0) {
+            // Bisher ging das still durch: die Ausgabe hoerte mitten im Satz
+            // auf, und im Log stand danach "Gesprochen" wie nach jeder Antwort.
+            ESP_LOGW(TAG, "Ton abgerissen nach %d ms.",
+                     (int)((int64_t)frames * 1000 / kRate));
+            break;
+        }
+        if (r == 0) break;
 
         size_t bytes = (size_t)r + vorn;
 
